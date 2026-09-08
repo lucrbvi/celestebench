@@ -1,0 +1,5 @@
+# Vendored third-party code: excluded from language/LOC stats (GitHub linguist
+# and compatible forges: GitLab, Gitea/Forgejo). Belt-and-braces: with the
+# submodule, GitHub already ignores its content in stats.
+deps/open8/** linguist-vendored=true
+deps/open8/** -diff -merge

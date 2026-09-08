@@ -1,0 +1,3 @@
+[submodule "deps/open8"]
+	path = deps/open8
+	url = https://github.com/ngagesdk/open8

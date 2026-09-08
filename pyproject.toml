@@ -1,0 +1,19 @@
+[project]
+name = "celestebench"
+version = "0.1.0"
+description = "http://lucrbvi.com/blog/celestebench/"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "av",
+    "numpy>=2.5.3",
+]
+
+[project.optional-dependencies]
+llm = [
+    "tau-ai==0.4.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
