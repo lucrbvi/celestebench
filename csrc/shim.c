@@ -1,6 +1,15 @@
 #include <SDL3/SDL.h>
+#include "audio.h"
 // Access the upstream frame loop and VM without its interactive main().
 #include "core.c"
+
+void open8_init_api(lua_State* L);
+
+void init_api(lua_State* L)
+{
+    open8_init_api(L);
+    audio_init_api(L);
+}
 
 static SDL_Renderer* renderer;
 
@@ -34,6 +43,7 @@ static void run_frame(void)
 static int run_cart_deterministic(void)
 {
     destroy_vm();
+    audio_reset();
     if (!init_vm(renderer) || luaL_dostring(vm, "srand(0)"))
     {
         return false;
@@ -82,6 +92,7 @@ void shim_quit(void)
     destroy_vm();
     destroy_cart(get_cart());
     destroy_memory();
+    audio_destroy();
     destroy_app();
     renderer = NULL;
 
@@ -126,9 +137,20 @@ int shim_step(uint32_t frames, uint8_t buttons)
     {
         touch_button_state_player_0 = buttons;
         run_frame();
+        audio_frame(has_update60 ? 60 : 30);
     }
 
     return (int)frames;
+}
+
+uint32_t shim_audio_samples(void)
+{
+    return audio_samples();
+}
+
+void shim_audio(int16_t* out)
+{
+    audio_copy(out);
 }
 
 uint32_t shim_frame_ms(void)

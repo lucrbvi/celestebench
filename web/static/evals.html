@@ -1,0 +1,197 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>evaluations · celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/">runs</a><a href="/evals" aria-current="page">evaluations</a><button id="newEvalToggle" aria-expanded="false" aria-haspopup="dialog" aria-controls="evalOverlay">new eval</button></nav></header>
+<div id="evalOverlay" hidden>
+  <form id="evalForm" onsubmit="return submitEval(event)">
+    <div id="evalDialog" role="dialog" aria-modal="true" aria-label="new evaluation">
+      <div class="dlg-head"><h2>new evaluation</h2><button type="button" id="evalClose" aria-label="close">✕</button></div>
+      <div class="dlg-body">
+        <div class="col">
+          <label>models, one per line<textarea id="evalModels" rows="10" spellcheck="false" placeholder="model name, e.g. muse-spark-1.3-contributor" title="One model per line. Append @api to override the API per model, e.g. minimax-m3@anthropic"></textarea></label>
+        </div>
+        <div class="col">
+          <div class="formgrid">
+            <label>preset <select id="evalPreset"><option value="opencode-go">OpenCode Go</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option><option value="mistral">Mistral</option><option value="custom">custom</option></select></label>
+            <label>API <select id="evalApi"><option value="openai-responses">OpenAI Responses</option><option value="openai-completions">OpenAI Completions</option><option value="anthropic">Anthropic</option><option value="google-generative-ai">Google Generative AI</option><option value="mistral-conversations">Mistral Conversations</option></select></label>
+            <label>base URL <input id="evalBaseUrl" type="url" required value="https://opencode.ai/zen/go/v1"></label>
+            <label>key env name <input id="evalKeyEnv" value="OPENCODE_GO_API_KEY"></label>
+            <label>API key <input id="evalKey" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="optional"></label>
+            <label>timeout (s) <input id="evalTimeout" type="number" min="1" value="120" title="Wall-clock budget for the whole run"></label>
+            <label>max frames / action <input id="evalFrames" type="number" min="1" value="30" title="Maximum frames one action holds a button"></label>
+            <label>max actions <input id="evalActions" type="number" min="1" value="4" title="Maximum actions the model may return per turn"></label>
+          </div>
+          <details><summary>advanced</summary><div class="formgrid">
+            <label>max images <input id="evalImages" type="number" min="1" value="3" title="Cap on images kept in context; providers reject more"></label><label>FPS <input id="evalFps" type="number" min="1" placeholder="empty = pause" title="Run the game in real time at this speed; leave empty to pause the game while the model thinks"></label>
+            <label>reasoning effort <input id="evalEffort" value="low"></label>
+            <label>Anthropic thinking tokens <input id="evalThinking" type="number" min="1024" placeholder="disabled"></label>
+          </div></details>
+        </div>
+      </div>
+      <div class="dlg-foot"><span id="evalError"></span><span id="evalCapacity" class="meta"></span><button id="evalSubmit" type="submit" disabled>launch eval</button></div>
+    </div>
+  </form>
+</div>
+<main id="evalPage"><section><h2>evaluations</h2><div id="evalJobs" class="meta">loading…</div></section></main>
+<script src="/live-audio.js"></script><script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+let evalJobs = [], polling = false;
+const cards = new Map();
+
+async function jsonRequest(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+function jobMeta(job) {
+  return [`${job.decisions} decisions · ${job.frames} frames`,
+    `${Number(job.elapsed).toFixed(1)}/${Number(job.timeout || 0).toFixed(0)}s · ${job.tokens == null ? "—" : job.tokens} tokens`];
+}
+
+function buildCard(job) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `<a class="button" href="/?run=${encodeURIComponent(job.name)}">${esc(job.model)}</a>
+    <div class="eval-status ${esc(job.status)}">${esc(job.status)}</div>
+    <div class="meta"><span></span><br><span></span></div>
+    ${["running", "completed"].includes(job.status) ? `<progress max="${job.timeout || job.elapsed || 1}" value="${job.elapsed}" aria-label="evaluation progress"></progress>` : ""}
+    ${job.status === "running" ? `<img class="eval-live" src="/live/${encodeURIComponent(job.name)}" alt="live game stream for ${esc(job.model)}">` : ""}
+    ${job.error ? `<details class="eval-error"><summary>${esc(job.error.length > 120 ? job.error.slice(0, 120) + "…" : job.error)}</summary><pre>${esc(job.error)}</pre></details>` : ""}`;
+  const [frames, time] = jobMeta(job);
+  const [framesNode, timeNode] = card.querySelectorAll(".meta span");
+  framesNode.textContent = frames;
+  timeNode.textContent = time;
+  if (job.status === "running") {
+    const sound = document.createElement("button");
+    sound.className = "eval-sound";
+    syncLiveSound(sound, job.name);
+    sound.onclick = () => toggleLiveSound(sound, job.name);
+    card.appendChild(sound);
+  }
+  if (job.status === "running" || job.status === "queued") {
+    const stop = document.createElement("button");
+    stop.textContent = "stop";
+    stop.onclick = async () => {
+      stop.disabled = true;
+      try {
+        await jsonRequest("/api/evals/" + job.id + "/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+        await poll();
+      } catch (error) { $("pollError").textContent = error.message; stop.disabled = false; }
+    };
+    card.appendChild(stop);
+  }
+  return card;
+}
+
+function updateCard(card, job) {
+  const [frames, time] = jobMeta(job);
+  const [framesNode, timeNode] = card.querySelectorAll(".meta span");
+  if (framesNode.textContent !== frames) framesNode.textContent = frames;
+  if (timeNode.textContent !== time) timeNode.textContent = time;
+  const progress = card.querySelector("progress");
+  if (progress) { progress.max = job.timeout || job.elapsed || 1; progress.value = job.elapsed; }
+}
+
+function renderEvalJobs() {
+  const box = $("evalJobs");
+  retainLiveSounds(evalJobs.filter(job => job.status === "running").map(job => job.name));
+  for (const [id, card] of cards)
+    if (!evalJobs.some(job => job.id === id)) { card.remove(); cards.delete(id); }
+  if (!evalJobs.length) { box.textContent = "no evaluations running"; return; }
+  if (!box.children.length) box.textContent = "";
+  const ordered = [];
+  for (const job of evalJobs) {
+    const shape = job.status + (job.error ? "!" : "");
+    let card = cards.get(job.id);
+    if (!card || card.dataset.shape !== shape) {
+      if (card) card.remove();
+      card = buildCard(job);
+      card.dataset.shape = shape;
+      cards.set(job.id, card);
+    } else updateCard(card, job);
+    ordered.push(card);
+  }
+  let ref = box.firstElementChild;
+  for (const card of ordered) {
+    if (card === ref) { ref = card.nextElementSibling; continue; }
+    box.insertBefore(card, ref);
+  }
+}
+async function poll() {
+  if (polling) return;
+  polling = true;
+  try {
+    evalJobs = (await jsonRequest("/api/evals")).filter(job => ["queued", "running"].includes(job.status));
+    renderEvalJobs();
+    updateEvalPlan();
+    $("pollError").textContent = "";
+  } catch (error) { $("pollError").textContent = `Refresh failed: ${error.message}`; }
+  finally { polling = false; }
+}
+async function submitEval(event) {
+  event.preventDefault();
+  const button = $("evalSubmit"), error = $("evalError");
+  button.disabled = true; error.textContent = "";
+  const value = id => $(id).value;
+  const body = {models:modelLines(), api:value("evalApi"), base_url:value("evalBaseUrl"),
+    key_env:value("evalKeyEnv"), api_key:value("evalKey") || undefined,
+    timeout:+value("evalTimeout"), max_frames:+value("evalFrames"), max_actions:+value("evalActions"),
+    max_images:+value("evalImages"), reasoning_effort:value("evalEffort")};
+  for (const [field, key] of [["evalFps", "fps"], ["evalThinking", "thinking_budget"]]) {
+    if (value(field)) body[key] = +value(field);
+  }
+  try {
+    await jsonRequest("/api/evals", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    $("evalKey").value = "";
+    closeEval();
+    await poll();
+  } catch (failure) { error.textContent = failure.message; }
+  updateEvalPlan();
+  return false;
+}
+function modelLines() {
+  return $("evalModels").value.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+}
+function updateEvalPlan() {
+  const models = modelLines(), submit = $("evalSubmit");
+  submit.disabled = !models.length;
+  submit.textContent = models.length <= 1 ? "launch eval" : `launch ${models.length} evals`;
+  const busy = evalJobs.filter(job => job.status === "running").length;
+  $("evalCapacity").textContent = busy >= 4 ? "4/4 emulator slots busy — new evals will queue"
+    : busy ? `${busy}/4 emulator slots busy` : "";
+}
+function openEval() {
+  $("evalOverlay").hidden = false;
+  $("newEvalToggle").setAttribute("aria-expanded", "true");
+  updateEvalPlan();
+  $("evalModels").focus();
+}
+function closeEval() {
+  $("evalOverlay").hidden = true;
+  $("newEvalToggle").setAttribute("aria-expanded", "false");
+}
+$("newEvalToggle").onclick = () => $("evalOverlay").hidden ? openEval() : closeEval();
+$("evalClose").onclick = closeEval;
+$("evalOverlay").onclick = event => { if (event.target === $("evalOverlay")) closeEval(); };
+document.addEventListener("keydown", event => { if (event.key === "Escape" && !$("evalOverlay").hidden) closeEval(); });
+$("evalModels").addEventListener("input", updateEvalPlan);
+$("evalPreset").onchange = () => {
+  const presets = {
+    "opencode-go": ["openai-responses", "https://opencode.ai/zen/go/v1", "OPENCODE_GO_API_KEY"],
+    openai: ["openai-responses", "https://api.openai.com/v1", "OPENAI_API_KEY"],
+    anthropic: ["anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"],
+    google: ["google-generative-ai", "https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY"],
+    mistral: ["mistral-conversations", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"],
+  };
+  const preset = presets[$("evalPreset").value];
+  if (!preset) return;
+  [$("evalApi").value, $("evalBaseUrl").value, $("evalKeyEnv").value] = preset;
+  if (!modelLines().length && $("evalPreset").value === "opencode-go") $("evalModels").value = "muse-spark-1.3-contributor";
+  updateEvalPlan();
+};
+for (const id of ["evalApi", "evalBaseUrl", "evalKeyEnv"]) $(id).oninput = () => { $("evalPreset").value = "custom"; };
+poll();
+setInterval(poll, 2000);
+</script></body></html>

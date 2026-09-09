@@ -1,11 +1,13 @@
 import json
 import io
+import http.client
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-import viewer
+from web import viewer
 
 
 class ViewerTest(unittest.TestCase):
@@ -144,6 +146,195 @@ class ViewerTest(unittest.TestCase):
                 fake.path = "/screenshot/../viewer.py"
                 viewer.Handler.do_GET(fake)
                 self.assertEqual(fake.status, 404)
+
+    def test_wait_marker_is_preserved_for_the_viewer(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self.run_dir(root, "run")
+            (folder / "actions.jsonl").write_text(json.dumps({
+                "decision": 0, "buttons": 0, "frames": 3, "action": "wait",
+            }) + "\n")
+            with patch.object(viewer, "RUNS", root):
+                action = viewer.load_decisions("run")["decisions"][0]["actions"][0]
+            self.assertTrue(action["wait"])
+
+
+class ViewerHTTPTest(unittest.TestCase):
+    def setUp(self):
+        self.server = viewer.ThreadingHTTPServer(("127.0.0.1", 0), viewer.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.connection = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+
+    def tearDown(self):
+        self.connection.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def post(self, path, payload, **headers):
+        self.connection.request("POST", path, json.dumps(payload),
+                                {"Content-Type": "application/json", **headers})
+        response = self.connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    def get(self, path):
+        self.connection.request("GET", path)
+        response = self.connection.getresponse()
+        return response.status, response.getheader("Content-Type"), response.read().decode()
+
+    def get_bytes(self, path):
+        self.connection.request("GET", path)
+        response = self.connection.getresponse()
+        return response.status, response.getheader("Content-Type"), response.read()
+
+    def delete(self, path, **headers):
+        self.connection.request("DELETE", path, headers=headers)
+        response = self.connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    def test_runs_and_evaluations_have_separate_linkable_pages(self):
+        status, content_type, runs = self.get("/")
+        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
+        self.assertIn('href="/evals"', runs)
+        self.assertIn('new URLSearchParams(location.search).get("run")', runs)
+        self.assertNotIn('id="evalJobs"', runs)
+        self.assertNotIn('"/api/evals"', runs)
+
+        status, content_type, evaluations = self.get("/evals")
+        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
+        self.assertIn('id="evalJobs"', evaluations)
+        self.assertIn('jsonRequest("/api/evals")', evaluations)
+        self.assertIn('href="/?run=${encodeURIComponent(job.name)}"', evaluations)
+        self.assertIn('.filter(job => ["queued", "running"].includes(job.status))', evaluations)
+        self.assertIn('class="eval-live" src="/live/${encodeURIComponent(job.name)}"', evaluations)
+        self.assertIn('toggleLiveSound(sound, job.name)', evaluations)
+
+        status, content_type, audio = self.get("/live-audio.js")
+        self.assertEqual((status, content_type), (200, "text/javascript; charset=utf-8"))
+        self.assertIn("new AudioContext()", audio)
+
+        status, content_type, css = self.get("/viewer.css")
+        self.assertEqual((status, content_type), (200, "text/css; charset=utf-8"))
+        self.assertIn(".card", css)
+
+    def test_delete_run_removes_files_and_terminal_evaluation_metadata(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runs"
+            folder = root / "bad-model" / "run"
+            folder.mkdir(parents=True)
+            (folder / "config.json").write_text("{}")
+            metadata = root / ".evals" / "job.json"
+            metadata.parent.mkdir()
+            metadata.write_text(json.dumps({
+                "id": "job", "name": "bad-model/run", "status": "failed",
+            }))
+            viewer.evals._jobs["job"] = {"id": "job", "name": "bad-model/run", "status": "failed"}
+            try:
+                with patch.object(viewer, "RUNS", root):
+                    self.assertEqual(self.delete("/api/run/bad-model%2Frun"),
+                                     (200, {"deleted": "bad-model/run"}))
+                self.assertFalse(folder.exists())
+                self.assertFalse(metadata.exists())
+                self.assertNotIn("job", viewer.evals._jobs)
+            finally:
+                viewer.evals._jobs.pop("job", None)
+
+    def test_delete_run_rejects_active_jobs_and_unsafe_paths(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "runs"
+            folder = root / "model" / "run"
+            folder.mkdir(parents=True)
+            outside = base / "outside"
+            outside.mkdir()
+            metadata = root / ".evals" / "job.json"
+            metadata.parent.mkdir()
+            metadata.write_text(json.dumps({
+                "id": "job", "name": "model/run", "status": "running",
+            }))
+            viewer.evals._jobs["job"] = {"id": "job", "name": "model/run", "status": "running"}
+            try:
+                with patch.object(viewer, "RUNS", root):
+                    self.assertEqual(self.delete("/api/run/model%2Frun")[0], 409)
+                    self.assertEqual(self.delete("/api/run/..%2Foutside")[0], 404)
+                    self.assertEqual(self.delete("/api/run/.evals")[0], 404)
+                self.assertTrue(folder.exists())
+                self.assertTrue(outside.exists())
+                self.assertTrue(metadata.exists())
+            finally:
+                viewer.evals._jobs.pop("job", None)
+
+    def test_runs_page_confirms_before_deleting_the_selected_run(self):
+        runs = self.get("/")[2]
+        self.assertIn('id="deleteRun"', runs)
+        self.assertIn("confirm(`Delete run", runs)
+        self.assertIn('{method:"DELETE"}', runs)
+        self.assertIn('"/live/" + encodeURIComponent(run.name)', runs)
+        self.assertIn('id="liveSound"', runs)
+        self.assertIn('src="/live-audio.js"', runs)
+
+    def test_live_endpoint_streams_the_atomic_frame(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "model" / "run"
+            folder.mkdir(parents=True)
+            frame = b"\x89PNG\r\nlatest"
+            (folder / "live.png").write_bytes(frame)
+            (folder / "live.done").touch()
+            job = {"name": "model/run", "status": "running"}
+            with patch.object(viewer, "RUNS", root), patch.object(
+                    viewer.evals, "list_evals", return_value=[job]):
+                status, content_type, body = self.get_bytes("/live/model%2Frun")
+            self.assertEqual(status, 200)
+            self.assertEqual(content_type, "multipart/x-mixed-replace; boundary=frame")
+            self.assertIn(b"Content-Type: image/png", body)
+            self.assertIn(frame, body)
+
+    def test_live_audio_reads_pcm_incrementally_and_can_start_at_tail(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "live.pcm"
+            path.write_bytes(b"01234567")
+
+            class Fake:
+                wfile = io.BytesIO()
+                status = None
+                response_headers = {}
+                def send_response(self, status): self.status = status
+                def send_header(self, name, value): self.response_headers[name] = value
+                def end_headers(self): pass
+                def send_error(self, status): self.status = status
+
+            fake = Fake()
+            viewer.Handler.audio(fake, path, "4")
+            self.assertEqual((fake.status, fake.wfile.getvalue()), (200, b"4567"))
+            self.assertEqual(fake.response_headers["X-Audio-Offset"], "8")
+            self.assertEqual(fake.response_headers["X-Audio-Rate"], "22050")
+
+            fake.wfile = io.BytesIO()
+            viewer.Handler.audio(fake, path, "tail")
+            self.assertEqual(fake.wfile.getvalue(), b"")
+            self.assertEqual(fake.response_headers["X-Audio-Offset"], "8")
+
+    def test_launch_stop_and_validation_errors_are_json(self):
+        job = {"id": "abc", "name": "model/run", "status": "running"}
+        payload = {"model": "custom-vlm", "api": "openai-completions",
+                   "base_url": "http://localhost:9000/v1", "timeout": 120}
+        with patch.object(viewer.evals, "start_eval", return_value=[job]) as launch:
+            self.assertEqual(self.post("/api/evals", payload), (201, [job]))
+            launch.assert_called_once_with(payload, viewer.RUNS)
+        with patch.object(viewer.evals, "stop_eval", return_value=job) as stop:
+            self.assertEqual(self.post("/api/evals/abc/stop", {}), (200, job))
+            stop.assert_called_once_with("abc")
+        with patch.object(viewer.evals, "start_eval", side_effect=ValueError("Invalid model")):
+            self.assertEqual(self.post("/api/evals", {}), (400, {"error": "Invalid model"}))
+
+    def test_cross_origin_and_non_json_requests_cannot_launch(self):
+        with patch.object(viewer.evals, "start_eval") as launch:
+            self.assertEqual(self.post("/api/evals", {}, Origin="https://example.com")[0], 403)
+            self.assertEqual(self.post("/api/evals", {}, Host="example.com")[0], 403)
+            self.assertEqual(self.post("/api/evals", {}, **{"Content-Type": "text/plain"})[0], 415)
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":

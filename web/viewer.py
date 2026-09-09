@@ -1,16 +1,21 @@
-"""A minimal web viewer for rollout runs. Usage: uv run python viewer.py"""
+"""A minimal web viewer for rollout runs. Usage: uv run python -m web.viewer"""
 
 import json
 import mimetypes
 import re
+import shutil
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import av
 
-ROOT = Path(__file__).parent
+from . import evals
+
+ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
+STATIC = Path(__file__).resolve().parent / "static"
 FPS = 30.0
 
 
@@ -52,7 +57,8 @@ def _video_info(path: Path) -> tuple[float | None, float | None]:
 def scan_runs() -> list[dict]:
     if not RUNS.is_dir():
         return []
-    folders = set()
+    jobs = {job["name"]: job for job in evals.list_evals(RUNS)}
+    folders = {RUNS / name for name in jobs}
     for path in RUNS.rglob("*"):
         if path.is_file() and path.name in {"config.json", "messages.jsonl", "actions.jsonl", "decisions.jsonl", "rollout.mp4"}:
             folders.add(path.parent)
@@ -65,9 +71,15 @@ def scan_runs() -> list[dict]:
         except (OSError, ValueError, UnicodeError):
             config = {}
         rel = folder.relative_to(RUNS).as_posix()
+        job = jobs.get(rel, {})
+        outcomes = _jsonl(folder / "decisions.jsonl")
         video_path = folder / "rollout.mp4"
         duration, fps = _video_info(video_path)
-        runs.append({"name": rel, "model": config.get("model", "?"),
+        runs.append({"name": rel, "model": job.get("model", config.get("model", "?")),
+                     "status": job.get("status", "archived"),
+                     "timeout": job.get("timeout", config.get("timeout")),
+                     "frames": job.get("frames", outcomes[-1].get("frame_end", 0) if outcomes else 0),
+                     "elapsed": job.get("elapsed"), "tokens": job.get("tokens"),
                      "video": "/video/" + quote(rel + "/rollout.mp4") if video_path.is_file()
                      and (duration is not None or fps is not None) else None,
                      "duration": round(duration, 2) if duration is not None else 0,
@@ -172,6 +184,8 @@ def load_decisions(name: str) -> dict:
             continue
         try:
             action = {"buttons": int(row["buttons"]), "frames": int(row["frames"])}
+            if row.get("action") == "wait":
+                action["wait"] = True
             if action["frames"] < 1:
                 continue
             for key in ("frame_start", "frame_end"):
@@ -216,18 +230,59 @@ def load_decisions(name: str) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        request_path = urlsplit(self.path).path
+        request = urlsplit(self.path)
+        request_path = request.path
         if request_path == "/":
-            return self.html()
+            return self.asset("viewer.html", "text/html; charset=utf-8")
+        if request_path == "/evals":
+            return self.asset("evals.html", "text/html; charset=utf-8")
+        if request_path == "/viewer.css":
+            return self.asset("viewer.css", "text/css; charset=utf-8")
+        if request_path == "/live-audio.js":
+            return self.asset("live-audio.js", "text/javascript; charset=utf-8")
         if request_path == "/api/runs":
             return self.json(scan_runs())
+        if request_path == "/api/evals":
+            return self.json(evals.list_evals(RUNS))
         if request_path.startswith("/api/run/"):
             name = unquote(request_path[len("/api/run/"):])
             folder = (RUNS / name).resolve()
             root = RUNS.resolve()
-            if not folder.is_relative_to(root) or not folder.is_dir():
+            if not folder.is_relative_to(root):
                 return self.send_error(404)
-            return self.json(load_decisions(folder.relative_to(RUNS).as_posix()))
+            name = folder.relative_to(root).as_posix()
+            job = next((job for job in evals.list_evals(RUNS) if job["name"] == name), None)
+            if not folder.is_dir() and job is None:
+                return self.send_error(404)
+            data = load_decisions(name)
+            if job and job["status"] == "running" and data["decisions"]:
+                last = data["decisions"][-1]
+                if last["status"] == "interrupted":
+                    last["status"], last["partial"] = "thinking", False
+            return self.json(data)
+        if request_path.startswith("/live/"):
+            name = unquote(request_path[len("/live/"):])
+            folder = (RUNS / name).resolve()
+            root = RUNS.resolve()
+            if not folder.is_relative_to(root):
+                return self.send_error(404)
+            name = folder.relative_to(root).as_posix()
+            job = next((job for job in evals.list_evals(RUNS) if job["name"] == name), None)
+            if job is None or job["status"] != "running":
+                return self.send_error(404)
+            return self.live(folder / "live.png", folder / "live.done")
+        if request_path.startswith("/live-audio/"):
+            name = unquote(request_path[len("/live-audio/"):])
+            folder = (RUNS / name).resolve()
+            root = RUNS.resolve()
+            if not folder.is_relative_to(root):
+                return self.send_error(404)
+            name = folder.relative_to(root).as_posix()
+            job = next((job for job in evals.list_evals(RUNS) if job["name"] == name), None)
+            if job is None or job["status"] != "running":
+                return self.send_error(404)
+            value = parse_qs(request.query).get("offset", ["tail"])[0]
+            return self.audio(folder / "live.pcm", value)
         if request_path.startswith("/video/"):
             path = (RUNS / unquote(request_path[len("/video/"):])).resolve()
             if not path.is_relative_to(RUNS.resolve()):
@@ -240,21 +295,135 @@ class Handler(BaseHTTPRequestHandler):
             return self.image(path)
         self.send_error(404)
 
-    def html(self):
+    def do_POST(self):
+        # A page on another origin must not be able to spend local API credentials.
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if (urlsplit("http://" + host).hostname not in {"localhost", "127.0.0.1", "::1"}
+                or (origin is not None and origin != "http://" + host)):
+            return self.json({"error": "Requests must come from this local viewer."}, 403)
+        if self.headers.get_content_type() != "application/json":
+            return self.json({"error": "Expected application/json."}, 415)
+        path = urlsplit(self.path).path
+        stop = re.fullmatch(r"/api/evals/([a-zA-Z0-9_-]+)/stop", path)
+        if path != "/api/evals" and not stop:
+            return self.json({"error": "Unknown endpoint."}, 404)
         try:
-            body = (ROOT / "viewer.html").read_bytes()
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 65536:
+                raise ValueError("Expected a JSON body up to 64 KiB.")
+            payload = json.loads(self.rfile.read(size))
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object.")
+            job = evals.stop_eval(stop[1]) if stop else evals.start_eval(payload, RUNS)
+        except (ValueError, UnicodeError) as error:
+            return self.json({"error": str(error)}, 400)
+        except KeyError:
+            return self.json({"error": "Unknown evaluation."}, 404)
+        except RuntimeError as error:
+            return self.json({"error": str(error)}, 409)
+        return self.json(job, 200 if stop else 201)
+
+    def do_DELETE(self):
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin")
+        if (urlsplit("http://" + host).hostname not in {"localhost", "127.0.0.1", "::1"}
+                or (origin is not None and origin != "http://" + host)):
+            return self.json({"error": "Requests must come from this local viewer."}, 403)
+        path = urlsplit(self.path).path
+        if not path.startswith("/api/run/"):
+            return self.json({"error": "Unknown endpoint."}, 404)
+        raw = RUNS / unquote(path[len("/api/run/"):])
+        root = RUNS.resolve()
+        folder = raw.resolve()
+        if (folder == root or not folder.is_relative_to(root) or not folder.is_dir()
+                or folder.relative_to(root).parts[0] == ".evals"
+                or any(part.is_symlink() for part in [raw, *raw.parents]
+                       if part != RUNS and part.is_relative_to(RUNS))):
+            return self.json({"error": "Unknown run."}, 404)
+        name = folder.relative_to(root).as_posix()
+        try:
+            evals.forget_run(name, RUNS)
+            shutil.rmtree(folder)
+            if folder.parent != root:
+                try:
+                    folder.parent.rmdir()
+                except OSError:
+                    pass
+        except RuntimeError as error:
+            return self.json({"error": str(error)}, 409)
+        except OSError:
+            return self.json({"error": "Could not delete the run."}, 409)
+        return self.json({"deleted": name})
+
+    def asset(self, name, content_type):
+        try:
+            body = (STATIC / name).read_bytes()
         except OSError:
             return self.send_error(404)
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def json(self, data):
+    def json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def live(self, path, done):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        modified = None
+        waiting_since = time.monotonic()
+        try:
+            while True:
+                try:
+                    current = path.stat().st_mtime_ns
+                    if current != modified:
+                        frame = path.read_bytes()
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/png\r\nContent-Length: "
+                            + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+                        )
+                        self.wfile.flush()
+                        modified = current
+                except OSError:
+                    if modified is None and time.monotonic() - waiting_since > 10:
+                        break
+                if done.is_file():
+                    break
+                time.sleep(1 / 30)
+            self.wfile.write(b"--frame--\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def audio(self, path: Path, value: str):
+        try:
+            size = path.stat().st_size
+            offset = size if value == "tail" else int(value)
+            if offset < 0 or offset > size:
+                raise ValueError
+            with path.open("rb") as source:
+                source.seek(offset)
+                body = source.read(44100)
+        except ValueError:
+            return self.send_error(400)
+        except OSError:
+            size = offset = 0
+            body = b""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Audio-Rate", "22050")
+        self.send_header("X-Audio-Offset", str(offset + len(body)))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -331,4 +500,10 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("http://localhost:8123")
-    ThreadingHTTPServer(("127.0.0.1", 8123), Handler).serve_forever()
+    with ThreadingHTTPServer(("127.0.0.1", 8123), Handler) as server:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            evals.shutdown()

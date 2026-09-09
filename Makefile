@@ -13,10 +13,11 @@ SDL3_INC := deps/open8-build/_deps/sdl3-src/include
 
 CC      := cc
 CFLAGS  := -O2 -std=c11 -fPIC -MMD -MP -Ideps/open8/src -I$(SDL3_INC)
-LDFLAGS := -shared -Ldeps/open8-build/_deps/sdl3-build -lSDL3 $(RPATH)
+LDFLAGS := -shared -Ldeps/open8-build/_deps/sdl3-build -lSDL3 -lm $(RPATH)
 
 Z8LUA := $(filter-out %/lua.c %/ltests.c,$(wildcard deps/open8/src/z8lua/*.c))
 SRC   := \
+    csrc/audio.c \
     csrc/shim.c \
     deps/open8/src/api.c \
     deps/open8/src/app.c \
@@ -44,6 +45,7 @@ build/obj/%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 build/obj/csrc/shim.o: deps/open8/src/core.c
+build/obj/deps/open8/src/api.o: CFLAGS += -Dinit_api=open8_init_api
 $(OBJ): $(SDL3_LIB)
 -include $(OBJ:.o=.d)
 

@@ -10,10 +10,10 @@ from PIL import Image
 from tau_agent import (
     AgentHarness, AgentHarnessConfig, AgentTool, AgentToolResult,
     AssistantMessage, ImageContent, MessageEndEvent, MessageUpdateEvent,
-    TextContent, ToolCall, TurnEndEvent, UserMessage,
+    TextContent, TurnEndEvent, UserMessage,
 )
 
-SYSTEM = """Play Celeste Classic. Climb upward and don't die. Call play exactly once with your next actions, in order. Each action holds a button bitmask for a number of frames: LEFT=1, RIGHT=2, UP=4, DOWN=8, O=16 (jump), X=32 (dash). Combine buttons by adding their values; 0 releases all buttons. The game runs at 30 fps. Observations are ordered oldest to newest; the last image is current. Use past images and actions to infer movement and learn from mistakes. In real-time mode the game keeps moving with buttons released while you think.
+SYSTEM = """Play Celeste Classic. Climb upward and don't die. Call play exactly once with your next actions, in order. A button action is {"buttons": bitmask, "frames": frames}; a wait action is {"action": "wait", "frames": frames}. Button values are LEFT=1, RIGHT=2, UP=4, DOWN=8, O=16 (jump), X=32 (dash); combine them by adding their values. Wait advances the game intentionally with all buttons released so you can observe the result later. You may put it anywhere in a sequence, for example [{"buttons": 18, "frames": 4}, {"action": "wait", "frames": 8}, {"buttons": 2, "frames": 4}]. A buttons value of 0 only releases the controls. The game runs at 30 fps. Each decision includes frames sampled across the interval since your previous decision, ordered oldest to newest; the last image is current. Only a few recent images are kept, older ones are dropped from context: write down important observations and changes in your reasoning as you go. Use past images and actions to infer movement and learn from mistakes. The game keeps moving while you think or plan.
 """
 
 
@@ -22,7 +22,7 @@ async def _select_action(call_id, arguments, signal=None, on_update=None):
     return AgentToolResult(content="Actions selected.")
 
 
-def _parse_play(calls, max_actions: int, max_frames: int) -> tuple[tuple[int, int], ...]:
+def _parse_play(calls, max_actions: int, max_frames: int) -> tuple[tuple[int | str, int], ...]:
     if len(calls) != 1 or calls[0].name != "play":
         raise ValueError("model must call play exactly once")
     arguments = calls[0].arguments
@@ -32,38 +32,32 @@ def _parse_play(calls, max_actions: int, max_frames: int) -> tuple[tuple[int, in
     if type(actions) is not list or not 1 <= len(actions) <= max_actions:
         raise ValueError(f"play requires 1..{max_actions} actions")
     for action in actions:
-        if type(action) is not dict or set(action) != {"buttons", "frames"}:
-            raise ValueError("each action requires exactly buttons and frames")
-        buttons, frames = action["buttons"], action["frames"]
-        if (type(buttons) is not int or type(frames) is not int
-                or not 0 <= buttons <= 63 or not 1 <= frames <= max_frames):
+        if type(action) is not dict or set(action) not in ({"buttons", "frames"}, {"action", "frames"}):
+            raise ValueError("each action must press buttons or wait")
+        waiting = action.get("action") == "wait"
+        buttons, frames = ("wait", action["frames"]) if waiting else (action.get("buttons"), action["frames"])
+        if (type(frames) is not int or not 1 <= frames <= max_frames
+                or "action" in action and not waiting
+                or not waiting and (type(buttons) is not int or not 0 <= buttons <= 63)):
             raise ValueError("model action is outside the allowed button/frame bounds")
-    return tuple((a["buttons"], a["frames"]) for a in actions)
+    return tuple(("wait", a["frames"]) if a.get("action") == "wait" else (a["buttons"], a["frames"])
+                 for a in actions)
 
 
 class TauPolicy:
-    """One API turn per observation, with bounded native conversation history.
+    """One persistent Tau harness per rollout, retaining its full conversation."""
 
-    Keep complete turns and provider reasoning blocks, including signatures.
-    Image history includes the current image; traces always retain everything.
-    """
-
-    def __init__(self, provider, model: str, *, max_frames=30, max_actions=1,
-                 timeout=60, trace=None, system=SYSTEM, action_history=16,
-                 image_history=3, reasoning_history=True):
-        if (type(max_frames) is not int or max_frames < 1 or type(max_actions) is not int
-                or max_actions < 1 or timeout <= 0):
-            raise ValueError("max_frames, max_actions and timeout must be positive")
-        if type(action_history) is not int or action_history < 0:
-            raise ValueError("action_history must be a non-negative integer")
-        if type(image_history) is not int or image_history < 1:
-            raise ValueError("image_history must be a positive integer")
+    def __init__(self, provider, model: str, *, max_frames=30, max_actions=4,
+                 max_images=3, trace=None, system=SYSTEM):
+        if type(max_frames) is not int or max_frames < 1 or type(max_actions) is not int or max_actions < 1:
+            raise ValueError("max_frames and max_actions must be positive")
+        if type(max_images) is not int or max_images < 1:
+            raise ValueError("max_images must be a positive integer")
         self.provider, self.model = provider, model
-        self.max_frames, self.max_actions, self.timeout = max_frames, max_actions, timeout
+        self.max_frames, self.max_actions = max_frames, max_actions
+        self.max_images = max_images
         self.trace, self.system = trace, system
-        self.window, self._step = action_history, 0
-        self.image_history, self.reasoning_history = image_history, reasoning_history
-        self._history: list[tuple] = []
+        self._step = 0
         self._feedback: str | None = None
         self.tool = AgentTool(
             name="play", label="Play actions", description="Play the next game actions.",
@@ -73,12 +67,21 @@ class TauPolicy:
                     "actions": {
                         "type": "array", "minItems": 1, "maxItems": max_actions,
                         "items": {
-                            "type": "object",
-                            "properties": {
-                                "buttons": {"type": "integer", "minimum": 0, "maximum": 63},
-                                "frames": {"type": "integer", "minimum": 1, "maximum": max_frames},
-                            },
-                            "required": ["buttons", "frames"], "additionalProperties": False,
+                            "oneOf": [{
+                                "type": "object",
+                                "properties": {
+                                    "buttons": {"type": "integer", "minimum": 0, "maximum": 63},
+                                    "frames": {"type": "integer", "minimum": 1, "maximum": max_frames},
+                                },
+                                "required": ["buttons", "frames"], "additionalProperties": False,
+                            }, {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["wait"]},
+                                    "frames": {"type": "integer", "minimum": 1, "maximum": max_frames},
+                                },
+                                "required": ["action", "frames"], "additionalProperties": False,
+                            }],
                         },
                     }
                 },
@@ -86,34 +89,56 @@ class TauPolicy:
             },
             execute_fn=_select_action,
         )
+        self.harness = AgentHarness(AgentHarnessConfig(
+            provider=provider, model=model, system=system,
+            tools=[self.tool], max_turns=1,
+        ))
 
-    async def __call__(self, frame) -> tuple[tuple[int, int], ...]:
-        png = BytesIO()
-        Image.fromarray(frame).save(png, format="PNG")
+    def _evict_old_images(self, *, incoming: int) -> None:
+        overflow = sum(isinstance(block, ImageContent) for message in self.harness._messages
+                       if isinstance(message, UserMessage) and not isinstance(message.content, str)
+                       for block in message.content) + incoming - self.max_images
+        messages = self.harness._messages
+        for index, message in enumerate(messages):
+            if overflow <= 0:
+                break
+            if not isinstance(message, UserMessage) or isinstance(message.content, str):
+                continue
+            images = [block for block in message.content if isinstance(block, ImageContent)]
+            drop = min(overflow, len(images))
+            if drop:
+                overflow -= drop
+                messages[index] = message.model_copy(update={"content": [
+                    block for block in message.content if not isinstance(block, ImageContent)]
+                    + images[drop:]})
+
+    async def __call__(self, frames) -> tuple[tuple[int, int], ...]:
+        frames = list(frames)
+        if not frames:
+            raise ValueError("policy needs at least one frame")
+        pngs = []
+        for frame in frames:
+            png = BytesIO()
+            Image.fromarray(frame).save(png, format="PNG")
+            pngs.append(base64.b64encode(png.getvalue()).decode())
+        # Providers cap images per request (e.g. 600 on OpenAI-compatible Go).
+        # Keep the newest frames, uniformly subsampling an oversized batch, and
+        # evict the oldest images from earlier turns to stay within budget.
+        if len(pngs) > self.max_images:
+            stride = len(pngs) / self.max_images
+            picked = [min(int(i * stride), len(pngs) - 1) for i in range(self.max_images)]
+            picked[-1] = len(pngs) - 1
+            pngs = [pngs[i] for i in picked]
+        self._evict_old_images(incoming=len(pngs))
         prompt = f"Decision {self._step}: choose the next actions using play."
         if self._step == 0:
             prompt += "\nYou have not acted yet."
         elif self._feedback:
             prompt += "\nYour previous call was rejected: " + self._feedback + "; buttons were released for one frame."
         self._feedback = None
-        observation = UserMessage(content=[
-            TextContent(text=prompt),
-            ImageContent(data=base64.b64encode(png.getvalue()).decode(), mime_type="image/png"),
+        observation = UserMessage(content=[TextContent(text=prompt)] + [
+            ImageContent(data=data, mime_type="image/png") for data in pngs
         ])
-        context = []
-        for i, turn in enumerate(self._history):
-            for message in turn:
-                if isinstance(message, UserMessage) and i < len(self._history) - self.image_history + 1:
-                    message = message.model_copy(update={"content": [
-                        block for block in message.content if not isinstance(block, ImageContent)]})
-                if isinstance(message, AssistantMessage) and not self.reasoning_history:
-                    message = message.model_copy(update={"content": [
-                        block for block in message.content if isinstance(block, ToolCall)]})
-                context.append(message)
-        harness = AgentHarness(AgentHarnessConfig(
-            provider=self.provider, model=self.model, system=self.system,
-            tools=[self.tool], max_turns=1,
-        ), messages=context)
         latest = None
         completed = None
         assistant_traced = False
@@ -140,7 +165,9 @@ class TauPolicy:
             self.trace.flush()
 
         try:
-            async with asyncio.timeout(self.timeout), aclosing(harness.prompt_message(observation)) as events:
+            # The rollout's wall-clock budget cancels this call; there is no
+            # per-decision timeout. Cancellation still traces partial reasoning.
+            async with aclosing(self.harness.prompt_message(observation)) as events:
                 async for event in events:
                     if isinstance(event, MessageUpdateEvent):
                         latest = event.message
@@ -151,12 +178,21 @@ class TauPolicy:
                     if isinstance(event, TurnEndEvent):
                         message = event.message
                         write_message(completed if completed is not None else message)
-                        if message.stop_reason in {"error", "aborted", "length"}:
+                        if message.stop_reason == "length":
+                            # Truncated before calling play (the token budget
+                            # includes reasoning). BALROG-style fallback: log
+                            # it, feed back, release the buttons and play on.
+                            self._step += 1
+                            self._feedback = ("your previous response hit the token limit "
+                                              "before calling play; answer again and keep it short")
+                            if self.trace is not None:
+                                self.trace.write(json.dumps(
+                                    {"status": "length", "step": self._step}, separators=(",", ":")) + "\n")
+                                self.trace.flush()
+                            return ((0, 1),)
+                        if message.stop_reason in {"error", "aborted"}:
                             raise RuntimeError(message.error_message or f"Model stopped: {message.stop_reason}")
                         self._step += 1
-                        if self.window:
-                            self._history.append((observation, message, *event.tool_results))
-                            self._history = self._history[-self.window:]
                         try:
                             actions = _parse_play(message.tool_calls, self.max_actions, self.max_frames)
                         except ValueError as error:

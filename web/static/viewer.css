@@ -1,0 +1,87 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 13px/1.5 ui-monospace, monospace; background: #111; color: #ccc; height: 100vh; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #333; flex: none; }
+h1, h2 { font-size: 15px; margin: 0; color: #eee; }
+h1 a { color: inherit; text-decoration: none; }
+a { color: #aaa; }
+nav { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+nav a[aria-current="page"] { color: #eee; text-decoration: none; }
+select, input, button, .button { background: #1a1a1a; color: #ccc; border: 1px solid #444; padding: 4px 8px; font: inherit; }
+button, .button { cursor: pointer; }
+button:hover, .button:hover { background: #243224; color: #cfc; }
+.button { display: inline-block; text-decoration: none; }
+.danger { color: #f88; }
+.danger:hover { background: #321d1d; color: #faa; }
+button:disabled { opacity: .5; cursor: default; }
+main { display: grid; grid-template-columns: 260px 544px 1fr; gap: 16px; padding: 16px; flex: 1; min-height: 0; }
+section, aside { overflow-y: auto; overflow-x: hidden; }
+video { width: 512px; height: 512px; image-rendering: pixelated; background: #000; display: block; }
+#timeline { position: relative; height: 34px; background: #1a1a1a; border: 1px solid #333; margin-top: 6px; cursor: crosshair; overflow: hidden; }
+.bar { position: absolute; top: 9px; height: 14px; border-radius: 2px; cursor: pointer; }
+.bar:hover { filter: brightness(1.5); }
+#playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #f55; pointer-events: none; }
+#clock { margin-top: 4px; color: #999; }
+#list .row { padding: 6px 8px; border-bottom: 1px solid #222; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#list .row:hover { background: #1d241d; }
+#list .row.current { background: #243224; color: #cfc; }
+.card { border: 1px solid #333; padding: 10px; margin-bottom: 12px; }
+#run { max-width: min(420px, 100%); }
+#panel img { width: 128px; height: 128px; image-rendering: pixelated; display: block; }
+#panel h3 { margin: 0 0 8px; font-size: 13px; color: #eee; }
+#panel p, #panel pre { margin: 0; }
+#panel pre { white-space: pre-wrap; word-break: break-word; }
+.thinking { white-space: pre-wrap; word-break: break-word; color: #a8c; background: #191420; padding: 8px; border-left: 2px solid #63c; }
+.reply { white-space: pre-wrap; word-break: break-word; color: #bbb; background: #181818; padding: 8px; border-left: 2px solid #666; }
+.act { color: #7d7; }
+.meta { color: #888; }
+#pollError, #evalError { color: #f88; white-space: pre-wrap; }
+
+/* Mask the key without password semantics: password managers ignore
+   autocomplete="off", but they only target type="password" fields. */
+#evalKey { -webkit-text-security: disc; }
+
+#evalPage { display: block; width: min(720px, 100%); }
+#evalPage h2 { margin-bottom: 12px; }
+#evalJobs .card { overflow-wrap: anywhere; }
+.eval-live { width: 256px; height: 256px; margin-top: 8px; display: block; image-rendering: pixelated; background: #000; }
+.eval-sound { margin: 8px 8px 0 0; }
+progress { width: 100%; height: 5px; accent-color: #7d7; }
+.eval-status { color: #9a9; }
+.eval-status.failed { color: #f88; }
+.eval-status.running { color: #fd8; }
+.eval-status.queued { color: #7ac; }
+.eval-error summary { color: #f88; cursor: pointer; overflow-wrap: anywhere; }
+.eval-error pre { margin: 4px 0 0; color: #f88; white-space: pre-wrap; word-break: break-word; }
+#evalOverlay { position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, .72); display: flex; align-items: center; justify-content: center; padding: 16px; }
+#evalOverlay[hidden] { display: none; }
+#evalDialog { background: #161616; border: 1px solid #444; width: min(880px, 100%); max-height: min(660px, 92vh); display: flex; flex-direction: column; }
+.dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #333; }
+.dlg-head h2 { font-size: 14px; font-weight: normal; }
+.dlg-body { display: grid; grid-template-columns: minmax(230px, 300px) 1fr; gap: 14px; padding: 14px; overflow: auto; }
+.dlg-body .col { display: grid; gap: 8px; align-content: start; min-width: 0; }
+#evalForm label { display: grid; gap: 3px; color: #999; }
+#evalForm input, #evalForm select, #evalModels { width: 100%; }
+#evalForm .formgrid { display: grid; grid-template-columns: repeat(2, minmax(150px, 1fr)); gap: 8px; }
+#evalForm details { color: #999; }
+#evalForm summary { cursor: pointer; }
+#evalModels { resize: vertical; min-height: 180px; white-space: pre; overflow-wrap: normal; }
+.dlg-foot { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid #333; }
+#evalSubmit { margin-left: auto; padding: 5px 14px; }
+#evalSubmit:disabled { opacity: .5; cursor: default; }
+
+@media (max-width: 900px) {
+  main { grid-template-columns: minmax(150px, 35%) minmax(0, 1fr); }
+  main > section:last-child { grid-column: 1 / -1; }
+  video, #liveFrame { max-width: 100%; height: auto !important; }
+  #evalDialog .dlg-body { grid-template-columns: 1fr; }
+  #evalModels { min-height: 120px; }
+}
+@media (max-width: 500px) {
+  body { height: auto; min-height: 100vh; }
+  main { display: flex; flex-direction: column; }
+  main aside { max-height: 35vh; }
+  main section { width: 100%; }
+  #evalForm .formgrid { grid-template-columns: 1fr; }
+  header { gap: 8px; }
+}

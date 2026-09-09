@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import unittest
 
 import numpy as np
@@ -61,20 +62,13 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
         return AssistantMessage(content=content, stop_reason=stop_reason)
 
     @staticmethod
-    def reasoning_assistant(call):
-        return AssistantMessage(content=[
-            ThinkingContent(thinking="plan", thinking_signature="sig-thinking"),
-            TextContent(text="I will play", text_signature="sig-text"),
-            call,
-        ], stop_reason="toolUse")
-
-    @staticmethod
     def call(arguments, name="play", call_id="call-1"):
         return ToolCall(id=call_id, name=name, arguments=arguments)
 
-    async def decide(self, provider, **kwargs):
-        frame = np.zeros((3, 4, 3), dtype="uint8")
-        return await TauPolicy(provider, "fake-model", **kwargs)(frame)
+    async def decide(self, provider, frames=None, **kwargs):
+        if frames is None:
+            frames = [np.zeros((3, 4, 3), dtype="uint8")]
+        return await TauPolicy(provider, "fake-model", **kwargs)(frames)
 
     async def test_valid_actions_and_single_png_request(self):
         provider = self.FakeProvider([
@@ -100,6 +94,25 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(decoded.size, (4, 3))
         self.assertIn('"role":"assistant"', trace.getvalue())
 
+    async def test_wait_can_be_mixed_with_button_actions(self):
+        provider = self.FakeProvider([
+            AssistantDoneEvent(reason="toolUse", message=self.assistant(self.call({
+                "actions": [
+                    {"buttons": 18, "frames": 2},
+                    {"action": "wait", "frames": 3},
+                    {"buttons": 2, "frames": 1},
+                ],
+            })))
+        ])
+
+        result = await self.decide(provider)
+
+        self.assertEqual(result, ((18, 2), ("wait", 3), (2, 1)))
+        policy = TauPolicy(provider, "fake-model")
+        variants = policy.tool.parameters["properties"]["actions"]["items"]["oneOf"]
+        self.assertEqual(variants[1]["required"], ["action", "frames"])
+        self.assertEqual(policy.max_actions, 4)
+
     async def test_rejects_malformed_actions(self):
         cases = [None, "actions", [], {"buttons": 1}, {"frames": 1}, [None], ["buttons"], [[]]]
         for actions in cases:
@@ -116,6 +129,12 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
             {"buttons": 64, "frames": 1},
             {"buttons": 1, "frames": 0},
             {"buttons": 1, "frames": 31},
+            {"action": "wait", "frames": 0},
+            {"action": "wait", "frames": 31},
+            {"action": "pause", "frames": 1},
+            {"action": "wait", "frames": True},
+            {"action": "wait", "frames": 1, "buttons": 0},
+            {"wait": 1},
         ]
         for action in cases:
             with self.subTest(action=action):
@@ -130,7 +149,7 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "actions": [{"buttons": 1, "frames": 1}, {"buttons": 2, "frames": 1}],
             })))
         ])
-        self.assertEqual(await self.decide(provider), ((0, 1),))
+        self.assertEqual(await self.decide(provider, max_actions=1), ((0, 1),))
 
         provider = self.FakeProvider([
             AssistantDoneEvent(reason="toolUse", message=self.assistant(
@@ -155,92 +174,144 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.decide(self.FakeProvider([text])), ((0, 1),))
 
+    async def test_length_truncation_falls_back_and_is_fed_back(self):
+        provider = self.SequenceProvider([
+            AssistantMessage(content=[TextContent(text="partial answer")], stop_reason="length"),
+            self.assistant(self.call({"actions": [{"buttons": 2, "frames": 1}]})),
+        ])
+        trace = io.StringIO()
+        policy = TauPolicy(provider, "fake-model", trace=trace)
+
+        self.assertEqual(await policy([np.zeros((3, 4, 3), dtype="uint8")]), ((0, 1),))
+        self.assertEqual(await policy([np.ones((3, 4, 3), dtype="uint8")]), ((2, 1),))
+        records = [json.loads(line) for line in trace.getvalue().splitlines()]
+        self.assertIn({"status": "length", "step": 1}, records)
+        prompt = provider.calls[1]["messages"][-1].content[0].text
+        self.assertIn("hit the token limit", prompt)
+
     async def test_rejected_call_is_reported_to_next_request_and_recovers(self):
         rejected = self.assistant(self.call({"actions": []}))
         recovered = self.assistant(self.call({"actions": [{"buttons": 2, "frames": 1}]}))
         provider = self.SequenceProvider([rejected, recovered])
         policy = TauPolicy(provider, "fake-model")
 
-        self.assertEqual(await policy(np.zeros((3, 4, 3), dtype="uint8")), ((0, 1),))
-        self.assertEqual(await policy(np.ones((3, 4, 3), dtype="uint8")), ((2, 1),))
+        self.assertEqual(await policy([np.zeros((3, 4, 3), dtype="uint8")]), ((0, 1),))
+        self.assertEqual(await policy([np.ones((3, 4, 3), dtype="uint8")]), ((2, 1),))
         prompt = provider.calls[1]["messages"][-1].content[0].text
         self.assertIn("previous call was rejected", prompt)
-        self.assertIn("1..1 actions", prompt)
+        self.assertIn("1..4 actions", prompt)
 
-    async def test_history_keeps_complete_turns_and_evicts_oldest(self):
-        message = self.assistant(self.call({"actions": [{"buttons": 1, "frames": 1}]}))
-        provider = self.SequenceProvider([message])
-        policy = TauPolicy(provider, "fake-model", action_history=16, image_history=1)
+    async def test_history_keeps_all_native_turns_images_reasoning_and_tool_results(self):
+        messages = [
+            AssistantMessage(content=[
+                ThinkingContent(thinking=f"plan-{step}", thinking_signature=f"sig-{step}"),
+                TextContent(text=f"reply-{step}", text_signature=f"text-sig-{step}"),
+                self.call({"actions": [{"buttons": step % 4, "frames": 1}]}, call_id=f"call-{step}"),
+            ], stop_reason="toolUse")
+            for step in range(20)
+        ]
+        provider = self.SequenceProvider(messages)
+        policy = TauPolicy(provider, "fake-model", max_images=20)
+        harness = policy.harness
 
-        for value in range(18):
-            await policy(np.full((3, 4, 3), value, dtype="uint8"))
+        for step in range(20):
+            await policy([np.full((3, 4, 3), step, dtype="uint8")])
+            self.assertIs(policy.harness, harness)
+            self.assertIs(policy.harness, harness)
 
-        context = provider.calls[17]["messages"]
-        self.assertEqual(len(context), 16 * 3 + 1)
+        history = harness.messages
+        self.assertEqual(len(history), 20 * 3)
         self.assertEqual(
-            [m.role for m in context],
-            (["user", "assistant", "toolResult"] * 16) + ["user"],
+            [message.role for message in history],
+            [role for _ in range(20) for role in ("user", "assistant", "toolResult")],
         )
-        self.assertNotIn("Decision 0", context[0].content[0].text)
-        self.assertIn("Decision 1", context[0].content[0].text)
-        self.assertEqual(len([m for m in context if m.role == "toolResult"]), 16)
+        for step in range(20):
+            user, assistant, result = history[step * 3:step * 3 + 3]
+            self.assertIn(f"Decision {step}", user.content[0].text)
+            image = next(block for block in user.content if isinstance(block, ImageContent))
+            with Image.open(io.BytesIO(base64.b64decode(image.data))) as decoded:
+                self.assertEqual(decoded.getpixel((0, 0))[0], step)
+            self.assertEqual(assistant.content[0].thinking_signature, f"sig-{step}")
+            self.assertEqual(assistant.content[1].text_signature, f"text-sig-{step}")
+            self.assertEqual(assistant.content[2].id, f"call-{step}")
+            self.assertEqual(result.tool_call_id, f"call-{step}")
 
-    async def test_zero_action_history_sends_only_current_observation(self):
-        message = self.assistant(self.call({"actions": [{"buttons": 1, "frames": 1}]}))
-        provider = self.SequenceProvider([message, message])
-        policy = TauPolicy(provider, "fake-model", action_history=0, image_history=1)
+        await policy([np.full((3, 4, 3), 20, dtype="uint8")])
+        context = provider.calls[-1]["messages"]
+        self.assertEqual(len(context), 20 * 3 + 1)
+        self.assertIn("Decision 0", context[0].content[0].text)
+        self.assertEqual(context[-1].role, "user")
 
-        await policy(np.zeros((3, 4, 3), dtype="uint8"))
-        await policy(np.ones((3, 4, 3), dtype="uint8"))
-        self.assertEqual([m.role for m in provider.calls[1]["messages"]], ["user"])
+    async def test_every_frame_since_previous_decision_becomes_an_image(self):
+        provider = self.FakeProvider([
+            AssistantDoneEvent(reason="toolUse", message=self.assistant(self.call({
+                "actions": [{"buttons": 2, "frames": 1}],
+            })))
+        ])
+        trace = io.StringIO()
+        policy = TauPolicy(provider, "fake-model", max_images=4, trace=trace)
 
-    async def test_image_history_keeps_latest_distinct_screenshots(self):
-        message = self.assistant(self.call({"actions": [{"buttons": 1, "frames": 1}]}))
-        provider = self.SequenceProvider([message])
-        policy = TauPolicy(provider, "fake-model", action_history=4, image_history=3)
+        await policy([np.full((3, 4, 3), 0, dtype="uint8")])
+        await policy([
+            np.full((3, 4, 3), 1, dtype="uint8"),
+            np.full((3, 4, 3), 2, dtype="uint8"),
+            np.full((3, 4, 3), 3, dtype="uint8"),
+        ])
 
-        for value in range(4):
-            await policy(np.full((3, 4, 3), value, dtype="uint8"))
-
-        users = [m for m in provider.calls[3]["messages"] if m.role == "user"]
-        images = [next(block for block in m.content if isinstance(block, ImageContent)).data for m in users
-                  if any(isinstance(block, ImageContent) for block in m.content)]
+        request = provider.calls[1]
+        content = request["messages"][-1].content
+        images = [block for block in content if isinstance(block, ImageContent)]
         self.assertEqual(len(images), 3)
-        self.assertEqual(len(set(images)), 3)
-        pixels = []
-        for data in images:
-            with Image.open(io.BytesIO(base64.b64decode(data))) as decoded:
-                pixels.append(decoded.getpixel((0, 0))[0])
-        self.assertEqual(pixels, [1, 2, 3])
+        for image, level in zip(images, (1, 2, 3), strict=True):
+            with Image.open(io.BytesIO(base64.b64decode(image.data))) as decoded:
+                self.assertEqual(decoded.getpixel((0, 0))[0], level)
+        # The whole earlier conversation, including the first frame, is still sent.
+        self.assertEqual(len(request["messages"]), 4)
+        first_user_images = [block for block in request["messages"][0].content
+                             if isinstance(block, ImageContent)]
+        self.assertEqual(len(first_user_images), 1)
 
-    async def test_reasoning_history_controls_outgoing_blocks_but_not_trace(self):
-        call = self.call({"actions": [{"buttons": 1, "frames": 1}]}, call_id="signed")
-        message = self.reasoning_assistant(call)
-        trace = io.StringIO()
-        provider = self.SequenceProvider([message, message])
-        policy = TauPolicy(provider, "fake-model", reasoning_history=True, trace=trace)
-        await policy(np.zeros((3, 4, 3), dtype="uint8"))
-        await policy(np.ones((3, 4, 3), dtype="uint8"))
-        prior = provider.calls[1]["messages"][1]
-        self.assertEqual([type(block) for block in prior.content], [ThinkingContent, TextContent, ToolCall])
-        self.assertEqual(prior.content[0].thinking_signature, "sig-thinking")
-        self.assertEqual(prior.content[1].text, "I will play")
-        self.assertIn("sig-thinking", trace.getvalue())
-        self.assertIn("I will play", trace.getvalue())
+    async def test_empty_frame_list_is_rejected(self):
+        provider = self.FakeProvider([])
+        policy = TauPolicy(provider, "fake-model")
+        with self.assertRaisesRegex(ValueError, "at least one frame"):
+            await policy([])
 
-        provider = self.SequenceProvider([message, message])
-        policy = TauPolicy(provider, "fake-model", reasoning_history=False)
-        await policy(np.zeros((3, 4, 3), dtype="uint8"))
-        await policy(np.ones((3, 4, 3), dtype="uint8"))
-        prior = provider.calls[1]["messages"][1]
-        self.assertEqual([type(block) for block in prior.content], [ToolCall])
-        trace = io.StringIO()
-        provider = self.SequenceProvider([message, message])
-        policy = TauPolicy(provider, "fake-model", reasoning_history=False, trace=trace)
-        await policy(np.zeros((3, 4, 3), dtype="uint8"))
-        await policy(np.ones((3, 4, 3), dtype="uint8"))
-        self.assertIn("sig-thinking", trace.getvalue())
-        self.assertIn("I will play", trace.getvalue())
+    async def test_image_cap_evicts_oldest_and_keeps_newest(self):
+        provider = self.SequenceProvider([
+            self.assistant(self.call({"actions": [{"buttons": 1, "frames": 1}]}))
+        ] * 4)
+        policy = TauPolicy(provider, "fake-model", max_images=2)
+        for step in range(4):
+            frames = [np.full((3, 4, 3), step, dtype="uint8")]
+            await policy(frames)
+        images = [block for message in policy.harness.messages if message.role == "user"
+                  for block in message.content if isinstance(block, ImageContent)]
+        self.assertEqual(len(images), 2)
+        # The oldest turns lost their images; the newest ones keep theirs.
+        with Image.open(io.BytesIO(base64.b64decode(images[-1].data))) as decoded:
+            self.assertEqual(decoded.getpixel((0, 0))[0], 3)
+        first_user = policy.harness.messages[0]
+        self.assertFalse(any(isinstance(b, ImageContent) for b in first_user.content))
+
+    async def test_oversized_decision_is_subsampled_keeping_last_frame(self):
+        provider = self.FakeProvider([
+            AssistantDoneEvent(reason="toolUse", message=self.assistant(self.call({
+                "actions": [{"buttons": 1, "frames": 1}],
+            })))
+        ])
+        policy = TauPolicy(provider, "fake-model", max_images=5)
+        levels = list(range(40))
+        await policy([np.full((3, 4, 3), level, dtype="uint8") for level in levels])
+        request = provider.calls[0]
+        images = [block for block in request["messages"][-1].content if isinstance(block, ImageContent)]
+        self.assertEqual(len(images), 5)
+        levels_seen = []
+        for image in images:
+            with Image.open(io.BytesIO(base64.b64decode(image.data))) as decoded:
+                levels_seen.append(decoded.getpixel((0, 0))[0])
+        self.assertEqual(levels_seen[-1], 39)  # the current frame survives
+        self.assertEqual(levels_seen, sorted(set(levels_seen)))  # evenly spaced
 
     async def test_trace_contains_only_new_turns(self):
         message = self.assistant(self.call({"actions": [{"buttons": 1, "frames": 1}]}))
@@ -255,43 +326,28 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
             ["user", "assistant", "toolResult", "user", "assistant", "toolResult"],
         )
 
-    async def test_timeout_is_enforced(self):
+    async def test_cancelled_calls_are_traced_and_recover(self):
         trace = io.StringIO()
-        with self.assertRaises(asyncio.TimeoutError):
-            await self.decide(self.FakeProvider(delay=0.05), timeout=0.001, trace=trace)
+        task = asyncio.create_task(self.decide(self.FakeProvider(delay=0.05), trace=trace))
+        await asyncio.sleep(0.005)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
         records = [__import__("json").loads(line) for line in trace.getvalue().splitlines()]
         self.assertEqual([record["role"] for record in records], ["user", "assistant"])
-        self.assertEqual(records[-1]["status"], "timeout")
+        self.assertEqual(records[-1]["status"], "cancelled")
         self.assertEqual(records[-1]["content"], [])
 
-    async def test_consecutive_interrupted_calls_keep_user_and_assistant_pairs(self):
+    async def test_consecutive_cancelled_calls_keep_user_and_assistant_pairs(self):
         trace = io.StringIO()
         for _ in range(2):
-            with self.assertRaises(asyncio.TimeoutError):
-                await self.decide(self.FakeProvider(delay=0.05), timeout=0.001, trace=trace)
+            task = asyncio.create_task(self.decide(self.FakeProvider(delay=0.05), trace=trace))
+            await asyncio.sleep(0.005)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
         records = [__import__("json").loads(line) for line in trace.getvalue().splitlines()]
         self.assertEqual([record["role"] for record in records], ["user", "assistant", "user", "assistant"])
-
-    async def test_timeout_traces_latest_partial_reasoning_once(self):
-        partial = self.assistant(text="thinking")
-
-        class SlowProvider:
-            def stream_response(self, **request):
-                async def events():
-                    yield ThinkingDeltaEvent(
-                        content_index=0, delta="thinking", partial=partial
-                    )
-                    await asyncio.sleep(1)
-                return events()
-
-        trace = io.StringIO()
-        with self.assertRaises(asyncio.TimeoutError):
-            await self.decide(SlowProvider(), timeout=0.05, trace=trace)
-        records = [__import__("json").loads(line) for line in trace.getvalue().splitlines()]
-        self.assertEqual([record["role"] for record in records], ["user", "assistant"])
-        self.assertEqual(records[-1]["status"], "timeout")
-        self.assertEqual(records[-1]["content"][0]["text"], "thinking")
-        self.assertEqual(records[-1]["stopReason"], "aborted")
 
     async def test_cancellation_traces_latest_partial_reasoning(self):
         partial = self.assistant(text="thinking")
@@ -305,7 +361,7 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
                 return events()
 
         trace = io.StringIO()
-        task = asyncio.create_task(self.decide(SlowProvider(), timeout=10, trace=trace))
+        task = asyncio.create_task(self.decide(SlowProvider(), trace=trace))
         await asyncio.sleep(0.05)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
