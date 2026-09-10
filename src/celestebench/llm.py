@@ -13,8 +13,10 @@ from tau_agent import (
     TextContent, TurnEndEvent, UserMessage,
 )
 
-SYSTEM = """Play Celeste Classic. Climb upward and don't die. Call play exactly once with your next actions, in order. A button action is {"buttons": bitmask, "frames": frames}; a wait action is {"action": "wait", "frames": frames}. Button values are LEFT=1, RIGHT=2, UP=4, DOWN=8, O=16 (jump), X=32 (dash); combine them by adding their values. Wait advances the game intentionally with all buttons released so you can observe the result later. You may put it anywhere in a sequence, for example [{"buttons": 18, "frames": 4}, {"action": "wait", "frames": 8}, {"buttons": 2, "frames": 4}]. A buttons value of 0 only releases the controls. The game runs at 30 fps. Each decision includes frames sampled across the interval since your previous decision, ordered oldest to newest; the last image is current. Only a few recent images are kept, older ones are dropped from context: write down important observations and changes in your reasoning as you go. Use past images and actions to infer movement and learn from mistakes. The game keeps moving while you think or plan.
-"""
+from .prompt import system_prompt
+
+# Kept as the default export: the RTC flavor with the standard budgets.
+SYSTEM = system_prompt(fps=30)
 
 
 async def _select_action(call_id, arguments, signal=None, on_update=None):
@@ -48,7 +50,7 @@ class TauPolicy:
     """One persistent Tau harness per rollout, retaining its full conversation."""
 
     def __init__(self, provider, model: str, *, max_frames=30, max_actions=4,
-                 max_images=3, trace=None, system=SYSTEM):
+                 max_images=3, trace=None, system=None, fps=None):
         if type(max_frames) is not int or max_frames < 1 or type(max_actions) is not int or max_actions < 1:
             raise ValueError("max_frames and max_actions must be positive")
         if type(max_images) is not int or max_images < 1:
@@ -56,7 +58,8 @@ class TauPolicy:
         self.provider, self.model = provider, model
         self.max_frames, self.max_actions = max_frames, max_actions
         self.max_images = max_images
-        self.trace, self.system = trace, system
+        self.trace, self.system = trace, system or system_prompt(
+            fps=fps, max_frames=max_frames, max_images=max_images)
         self._step = 0
         self._feedback: str | None = None
         self.tool = AgentTool(

@@ -15,7 +15,7 @@ from tau_ai import (
     MistralConversationsProvider, OpenAICompatibleConfig, OpenAICompatibleProvider,
 )
 
-from celestebench.llm import SYSTEM, TauPolicy
+from celestebench.llm import TauPolicy
 from celestebench.rollout import rollout
 
 
@@ -90,13 +90,13 @@ async def main():
         provider = provider_type(config)
     # The runner owns directory creation, so refuse overwrites before opening logs.
     policy = TauPolicy(provider, args.model, max_frames=args.max_frames, max_actions=args.max_actions,
-                       max_images=args.max_images)
+                       max_images=args.max_images, fps=args.fps)
     try:
         # Open the trace only after rollout has created its output directory.
         async def decide(frames):
             if policy.trace is None:
                 policy.trace = Trace((args.output / "messages.jsonl").open("xb"), encoding="utf-8")
-                config = vars(args) | {"output": str(args.output), "system": SYSTEM,
+                config = vars(args) | {"output": str(args.output), "system": policy.system,
                                        "tau_version": "0.4.1", "max_retries": 0,
                                        "session": session}
                 (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")

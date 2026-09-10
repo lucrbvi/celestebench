@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
+from .prompt import system_prompt
 from .rollout import _png, rollout
 
 
@@ -187,8 +188,10 @@ class Episode:
 
 def server(episode):
     max_frames = episode.options["max_frames"]
-    mode = "Lite; the game advances only through submitted actions" if episode.options["fps"] is None else f"RTC at {episode.options['fps']:g} fps; the game continues while you reason"
-    instructions = f"""Play Celeste Classic. This episode is {mode}. Call observe once initially, then call play with an ordered action batch. Button values are LEFT=1, RIGHT=2, UP=4, DOWN=8, O=16 (jump), and X=32 (dash); add values to combine buttons. A button action is {{\"buttons\": bitmask, \"frames\": frames}}. A wait action is {{\"action\": \"wait\", \"frames\": frames}}; it advances with neutral input like buttons=0 but is recorded as an intentional wait. Frames must be 1 through {max_frames}. Responses contain at most {episode.options['max_images']} sampled images, ordered oldest to newest, and frame_ids identifies their game-frame positions; the last image is current. The server owns the episode timeout and frame budgets; tools cannot reset or alter them."""
+    instructions = system_prompt(fps=episode.options["fps"],
+                                 max_frames=max_frames,
+                                 max_images=episode.options["max_images"],
+                                 mcp=True)
     app = FastMCP("CelesteBench", instructions=instructions, stateless_http=True,
                   json_response=True, max_request_body_size=1024 * 1024)
 
