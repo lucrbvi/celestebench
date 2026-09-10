@@ -1,7 +1,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
 <body>
-<header><h1><a href="/">celestebench</a></h1><select id="run" aria-label="run"></select><span id="meta" class="meta"></span><button id="liveSound" type="button" aria-pressed="false" hidden>sound</button><button id="deleteRun" class="danger" type="button" disabled>delete run</button><span id="pollError" role="status"></span><nav><a href="/" aria-current="page">runs</a><a href="/evals">evaluations</a></nav></header>
+<header><h1><a href="/">celestebench</a></h1><select id="run" aria-label="run"></select><span id="meta" class="meta"></span><button id="deleteRun" class="danger" type="button" disabled>delete run</button><span id="pollError" role="status"></span><nav><a href="/" aria-current="page">runs</a><a href="/evals">evaluations</a></nav></header>
 <main>
 <aside id="list"></aside>
 <section>
@@ -12,7 +12,7 @@
 </section>
 <section id="panel"></section>
 </main>
-<script src="/live-audio.js"></script><script>
+<script>
 const $ = id => document.getElementById(id);
 const video = $("video");
 const BITS = ["LEFT", "RIGHT", "UP", "DOWN", "O", "X"];
@@ -112,9 +112,6 @@ async function jsonRequest(url, options) {
 }
 function attachVideo(run) {
   const liveFrame = $("liveFrame");
-  $("liveSound").hidden = run.status !== "running";
-  if (run.status === "running") syncLiveSound($("liveSound"), run.name);
-  else stopLiveSound(run.name);
   if (run.status === "running") {
     video.style.display = "none";
     if (video.hasAttribute("src")) { video.removeAttribute("src"); video.load(); }
@@ -142,7 +139,6 @@ function attachVideo(run) {
 async function loadRun(name) {
   const run = runs.find(r => r.name === name);
   if (!run) return;
-  if (selectedRun && selectedRun !== name) stopLiveSound(selectedRun);
   const id = ++request;
   selectedRun = name;
   loadedStatus = run.status;
@@ -253,7 +249,6 @@ $("deleteRun").onclick = async () => {
     $("pollError").textContent = "";
   } catch (error) { $("pollError").textContent = error.message; $("deleteRun").disabled = false; }
 };
-$("liveSound").onclick = () => toggleLiveSound($("liveSound"), selectedRun);
 window.onpopstate = () => {
   const name = new URLSearchParams(location.search).get("run");
   if (runs.some(run => run.name === name)) loadRun(name).catch(reportError);

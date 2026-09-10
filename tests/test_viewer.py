@@ -188,6 +188,19 @@ class ViewerHTTPTest(unittest.TestCase):
         response = self.connection.getresponse()
         return response.status, response.getheader("Content-Type"), response.read()
 
+    def test_json_ignores_a_client_that_disconnects_before_the_body(self):
+        class ClosedClient:
+            def write(self, body):
+                raise BrokenPipeError
+
+        handler = type("Handler", (), {
+            "wfile": ClosedClient(),
+            "send_response": lambda self, status: None,
+            "send_header": lambda self, name, value: None,
+            "end_headers": lambda self: None,
+        })()
+        viewer.Handler.json(handler, {"ok": True})
+
     def delete(self, path, **headers):
         self.connection.request("DELETE", path, headers=headers)
         response = self.connection.getresponse()
@@ -208,11 +221,7 @@ class ViewerHTTPTest(unittest.TestCase):
         self.assertIn('href="/?run=${encodeURIComponent(job.name)}"', evaluations)
         self.assertIn('.filter(job => ["queued", "running"].includes(job.status))', evaluations)
         self.assertIn('class="eval-live" src="/live/${encodeURIComponent(job.name)}"', evaluations)
-        self.assertIn('toggleLiveSound(sound, job.name)', evaluations)
-
-        status, content_type, audio = self.get("/live-audio.js")
-        self.assertEqual((status, content_type), (200, "text/javascript; charset=utf-8"))
-        self.assertIn("new AudioContext()", audio)
+        self.assertNotIn("live-audio", evaluations)
 
         status, content_type, css = self.get("/viewer.css")
         self.assertEqual((status, content_type), (200, "text/css; charset=utf-8"))
@@ -271,8 +280,7 @@ class ViewerHTTPTest(unittest.TestCase):
         self.assertIn("confirm(`Delete run", runs)
         self.assertIn('{method:"DELETE"}', runs)
         self.assertIn('"/live/" + encodeURIComponent(run.name)', runs)
-        self.assertIn('id="liveSound"', runs)
-        self.assertIn('src="/live-audio.js"', runs)
+        self.assertNotIn('id="liveSound"', runs)
 
     def test_live_endpoint_streams_the_atomic_frame(self):
         with TemporaryDirectory() as tmp:
@@ -290,31 +298,6 @@ class ViewerHTTPTest(unittest.TestCase):
             self.assertEqual(content_type, "multipart/x-mixed-replace; boundary=frame")
             self.assertIn(b"Content-Type: image/png", body)
             self.assertIn(frame, body)
-
-    def test_live_audio_reads_pcm_incrementally_and_can_start_at_tail(self):
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "live.pcm"
-            path.write_bytes(b"01234567")
-
-            class Fake:
-                wfile = io.BytesIO()
-                status = None
-                response_headers = {}
-                def send_response(self, status): self.status = status
-                def send_header(self, name, value): self.response_headers[name] = value
-                def end_headers(self): pass
-                def send_error(self, status): self.status = status
-
-            fake = Fake()
-            viewer.Handler.audio(fake, path, "4")
-            self.assertEqual((fake.status, fake.wfile.getvalue()), (200, b"4567"))
-            self.assertEqual(fake.response_headers["X-Audio-Offset"], "8")
-            self.assertEqual(fake.response_headers["X-Audio-Rate"], "22050")
-
-            fake.wfile = io.BytesIO()
-            viewer.Handler.audio(fake, path, "tail")
-            self.assertEqual(fake.wfile.getvalue(), b"")
-            self.assertEqual(fake.response_headers["X-Audio-Offset"], "8")
 
     def test_launch_stop_and_validation_errors_are_json(self):
         job = {"id": "abc", "name": "model/run", "status": "running"}

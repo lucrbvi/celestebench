@@ -17,7 +17,6 @@ LDFLAGS := -shared -Ldeps/open8-build/_deps/sdl3-build -lSDL3 -lm $(RPATH)
 
 Z8LUA := $(filter-out %/lua.c %/ltests.c,$(wildcard deps/open8/src/z8lua/*.c))
 SRC   := \
-    csrc/audio.c \
     csrc/shim.c \
     deps/open8/src/api.c \
     deps/open8/src/app.c \

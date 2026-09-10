@@ -7,7 +7,7 @@ import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import av
 
@@ -54,6 +54,11 @@ def _video_info(path: Path) -> tuple[float | None, float | None]:
         return None, None
 
 
+def apply_nested(folder: Path) -> Path:
+    """External harnesses (Codex) nest the rollout engine one level deeper."""
+    return folder / "rollout" if (folder / "rollout").is_dir() else folder
+
+
 def scan_runs() -> list[dict]:
     if not RUNS.is_dir():
         return []
@@ -62,33 +67,41 @@ def scan_runs() -> list[dict]:
     for path in RUNS.rglob("*"):
         if path.is_file() and path.name in {"config.json", "messages.jsonl", "actions.jsonl", "decisions.jsonl", "rollout.mp4"}:
             folders.add(path.parent)
+    for name, job in jobs.items():
+        if job.get("harness") == "codex":
+            folders.discard(RUNS / name / "rollout")  # merged into its wrapper row
     runs = []
     for folder in sorted(folders):
         try:
-            config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+            rel = folder.relative_to(RUNS).as_posix()
+            job = jobs.get(rel, {})
+            # Harness wrappers hold the metadata; game files sit one level down,
+            # so the wrapper row already covers the nested rollout directory.
+            data_folder = apply_nested(folder)
+            config = json.loads((data_folder / "config.json").read_text(encoding="utf-8"))
             if not isinstance(config, dict):
                 config = {}
         except (OSError, ValueError, UnicodeError):
-            config = {}
-        rel = folder.relative_to(RUNS).as_posix()
-        job = jobs.get(rel, {})
-        outcomes = _jsonl(folder / "decisions.jsonl")
-        video_path = folder / "rollout.mp4"
+            continue
+        outcomes = _jsonl(data_folder / "decisions.jsonl")
+        video_path = data_folder / "rollout.mp4"
         duration, fps = _video_info(video_path)
+        video = None
+        if video_path.is_file() and (duration is not None or fps is not None):
+            video = "/video/" + quote(data_folder.relative_to(RUNS).as_posix() + "/rollout.mp4")
         runs.append({"name": rel, "model": job.get("model", config.get("model", "?")),
                      "status": job.get("status", "archived"),
                      "timeout": job.get("timeout", config.get("timeout")),
                      "frames": job.get("frames", outcomes[-1].get("frame_end", 0) if outcomes else 0),
                      "elapsed": job.get("elapsed"), "tokens": job.get("tokens"),
-                     "video": "/video/" + quote(rel + "/rollout.mp4") if video_path.is_file()
-                     and (duration is not None or fps is not None) else None,
+                     "video": video,
                      "duration": round(duration, 2) if duration is not None else 0,
                      "fps": fps})
     return runs
 
 
 def load_decisions(name: str) -> dict:
-    folder = RUNS / name
+    folder = apply_nested(RUNS / name)
     rows = _jsonl(folder / "actions.jsonl")
     outcomes = _jsonl(folder / "decisions.jsonl")
     messages = _jsonl(folder / "messages.jsonl")
@@ -238,8 +251,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.asset("evals.html", "text/html; charset=utf-8")
         if request_path == "/viewer.css":
             return self.asset("viewer.css", "text/css; charset=utf-8")
-        if request_path == "/live-audio.js":
-            return self.asset("live-audio.js", "text/javascript; charset=utf-8")
         if request_path == "/api/runs":
             return self.json(scan_runs())
         if request_path == "/api/evals":
@@ -270,19 +281,11 @@ class Handler(BaseHTTPRequestHandler):
             job = next((job for job in evals.list_evals(RUNS) if job["name"] == name), None)
             if job is None or job["status"] != "running":
                 return self.send_error(404)
+            # External harnesses nest the rollout engine one level deeper.
+            rollout = folder / "rollout"
+            if rollout.is_dir():
+                folder = rollout
             return self.live(folder / "live.png", folder / "live.done")
-        if request_path.startswith("/live-audio/"):
-            name = unquote(request_path[len("/live-audio/"):])
-            folder = (RUNS / name).resolve()
-            root = RUNS.resolve()
-            if not folder.is_relative_to(root):
-                return self.send_error(404)
-            name = folder.relative_to(root).as_posix()
-            job = next((job for job in evals.list_evals(RUNS) if job["name"] == name), None)
-            if job is None or job["status"] != "running":
-                return self.send_error(404)
-            value = parse_qs(request.query).get("offset", ["tail"])[0]
-            return self.audio(folder / "live.pcm", value)
         if request_path.startswith("/video/"):
             path = (RUNS / unquote(request_path[len("/video/"):])).resolve()
             if not path.is_relative_to(RUNS.resolve()):
@@ -374,7 +377,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def live(self, path, done):
         self.send_response(200)
@@ -404,29 +410,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"--frame--\r\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
-
-    def audio(self, path: Path, value: str):
-        try:
-            size = path.stat().st_size
-            offset = size if value == "tail" else int(value)
-            if offset < 0 or offset > size:
-                raise ValueError
-            with path.open("rb") as source:
-                source.seek(offset)
-                body = source.read(44100)
-        except ValueError:
-            return self.send_error(400)
-        except OSError:
-            size = offset = 0
-            body = b""
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Audio-Rate", "22050")
-        self.send_header("X-Audio-Offset", str(offset + len(body)))
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
     def video(self, path: Path):
         if not path.is_file():

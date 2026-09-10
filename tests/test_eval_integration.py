@@ -88,10 +88,7 @@ class EvalIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(final["tokens"], 20 * (final["decisions"] - 1))
         folder = self.runs / job["name"]
         self.assertEqual(len(list((folder / "screenshots").glob("*.png"))), final["decisions"])
-        self.assertTrue((folder / "live.pcm").stat().st_size)
         self.assertTrue((folder / "rollout.mp4").stat().st_size)
-        with av.open(str(folder / "rollout.mp4")) as recording:
-            self.assertEqual(recording.streams.audio[0].rate, 22050)
         self.assertEqual(len(self.api.requests), final["decisions"])
         self.assertGreater(len(self.api.requests[-1]["messages"]), len(self.api.requests[0]["messages"]))
         self.assertNotIn("local-test-key", (folder / "config.json").read_text())

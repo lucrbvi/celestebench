@@ -2,7 +2,7 @@
 
 CelesteBench is an evaluation and a benchmark for mesuring how good LLMs are at real-time control in the video game Celeste Classic.
 
-We are running the Celeste Classic game inside open8, a PICO-8 open-source reproduction in C99. We have our own fork in `./deps/open8` (to add the audio module and other stuff). We are building it with the Makefile in the root of the project (we don't need CMake like they do since they want to target 9 platforms).
+We are running the Celeste Classic game inside open8, a PICO-8 open-source reproduction in C99. We have our own fork in `./deps/open8` for project-specific changes. We are building it with the Makefile in the root of the project (we don't need CMake like they do since they want to target 9 platforms).
 
 The LLMs are running, for now, in our own harness we built on top of [Tau](https://github.com/huggingface/tau) a python-version of [Pi](https://pi.dev/). The harness works by conserving all the CoTs and gives the last 3 frames to the model. We ask the model to use our tool `play` and to write a serie of actions in JSON-format, this serie of action helps them to take account of their own latencies (most models use CoTs).
 

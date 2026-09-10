@@ -26,7 +26,6 @@ class RolloutTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row["buttons"] for row in rows], [2, 0, 0])
             self.assertEqual((output / "checkpoint.state").read_bytes(), b"\0\2\0\0\0")
             self.assertTrue((output / "live.png").is_file())
-            self.assertTrue((output / "live.pcm").stat().st_size)
             self.assertTrue((output / "live.done").is_file())
 
     async def test_multi_action_policy_writes_video_and_history(self):
@@ -146,6 +145,37 @@ class RolloutTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((output / "actions.jsonl").read_text(), "")
             with av.open(str(output / "rollout.mp4")) as video:
                 self.assertEqual(len(list(video.decode(video=0))), 1)
+
+    async def test_strict_timeout_truncates_synchronous_action_batch(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "run"
+            result = await rollout(lambda frame: (2, 100000), output,
+                                   timeout=0.1, strict_timeout=True,
+                                   max_frames=100000)
+            outcome = json.loads((output / "decisions.jsonl").read_text())
+            action = json.loads((output / "actions.jsonl").read_text())
+            self.assertEqual(outcome["status"], "timeout")
+            self.assertEqual(result["frames"], outcome["frame_end"])
+            self.assertEqual(action["frames"], result["frames"] - 1)
+            self.assertLess(action["frames"], 100000)
+
+    async def test_realtime_strict_deadline_cuts_batch_but_default_finishes_it(self):
+        for strict in (True, False):
+            with self.subTest(strict=strict), tempfile.TemporaryDirectory() as root:
+                output = Path(root) / "run"
+                await rollout(lambda frames: [(2, 10), (1, 2)], output,
+                              fps=20, timeout=0.25, max_actions=2,
+                              strict_timeout=strict)
+                actions = [json.loads(line) for line in
+                           (output / "actions.jsonl").read_text().splitlines()]
+                outcome = json.loads((output / "decisions.jsonl").read_text())
+                if strict:
+                    self.assertEqual(outcome["status"], "timeout")
+                    self.assertEqual(len(actions), 1)
+                    self.assertLess(actions[0]["frames"], 10)
+                else:
+                    self.assertEqual(outcome["status"], "played")
+                    self.assertEqual([a["frames"] for a in actions], [10, 2])
 
     async def test_policy_timeout_is_logged_and_ends_gracefully(self):
         async def policy(frame):

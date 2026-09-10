@@ -22,9 +22,6 @@ class Open8Test(unittest.TestCase):
             for buttons, frames in [(0, 60), (Button.O, 1), (0, 60), (Button.RIGHT, 100)]:
                 env.step(buttons, frames)
             checkpoint = env.save_state()
-            self.assertEqual((env.audio.dtype, env.audio.size), (np.dtype(np.int16), 100 * 22050 // 30))
-            self.assertGreater(np.abs(env.audio).max(), 0)
-            self.assertLess(np.abs(env.audio.astype(np.int32)).max(), 32767)
             saved_image = env.framebuffer
             expected = env.step(Button.RIGHT | Button.O, 90)
             branch = env.save_state()
@@ -49,16 +46,12 @@ class Open8Test(unittest.TestCase):
                     raise RuntimeError('rollout interrupted')
             with av.open(str(video)) as recording:
                 self.assertEqual(recording.streams.video[0].average_rate, 30)
-                self.assertEqual(recording.streams.audio[0].rate, 22050)
+                self.assertEqual(len(recording.streams.video), 1)
                 frames = list(recording.decode(video=0))
-            with av.open(str(video)) as recording:
-                samples = np.concatenate([frame.to_ndarray().reshape(-1) for frame in recording.decode(audio=0)])
                 self.assertEqual(len(frames), 45)
                 self.assertEqual((frames[0].width, frames[0].height), (512, 512))
                 self.assertEqual(frames[-1].time - frames[0].time, 44 / 30)
                 self.assertFalse(np.array_equal(frames[0].to_ndarray(), frames[-1].to_ndarray()))
-                self.assertGreater(np.abs(samples).max(), 0)
-                self.assertAlmostEqual(len(samples) / 22050, 45 / 30, delta=0.2)  # AAC pads its final packet.
         env.close()
         with self.assertRaises(RuntimeError):
             env.step()

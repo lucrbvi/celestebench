@@ -34,7 +34,8 @@ def _int(value, name):
 
 async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                   max_frames: int = 30, max_actions: int = 1,
-                  frames: int | None = None, fps: float | None = None) -> dict:
+                  frames: int | None = None, fps: float | None = None,
+                  strict_timeout: bool = False) -> dict:
     """Run ``policy``, which receives every frame played since its previous call
     (oldest to newest, the last one current) and returns (buttons, frames),
     ("wait", frames), or a list of those, and save a video, action log, and
@@ -45,7 +46,8 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
     ``frames`` optionally caps the total environment frames played (long holds
     are cut). With ``fps`` the environment runs in real time: frames tick at
     that rate with buttons released while the policy thinks, so a slow model
-    wastes world time."""
+    wastes world time. ``strict_timeout`` also stops an in-progress action
+    batch at the wall-clock deadline."""
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                                 or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("timeout must be a positive number of seconds")
@@ -67,7 +69,6 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
     screenshots = directory / "screenshots"
     screenshots.mkdir()
     live = directory / "live.png"
-    live_audio = directory / "live.pcm"
     live_done = directory / "live.done"
     started = time.perf_counter()
     deadline = None if timeout is None else started + timeout
@@ -76,15 +77,12 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
     calls = 0
     with Open8() as env:
         try:
-            with (env.record(video), live_audio.open("wb") as audio,
-                  actions.open("w", encoding="utf-8") as history,
+            with (env.record(video), actions.open("w", encoding="utf-8") as history,
                   (directory / "decisions.jsonl").open("w", encoding="utf-8") as outcomes):
                 def publish(image):
                     temporary = live.with_suffix(".tmp")
                     temporary.write_bytes(_png(image))
                     temporary.replace(live)
-                    audio.write(env.audio.tobytes())
-                    audio.flush()
 
                 unseen = []
 
@@ -103,12 +101,18 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                     next_tick = max(next_tick, now)
                     delay = next_tick - now
                     if delay > 0:
-                        await asyncio.sleep(delay)
+                        if strict_timeout and deadline is not None:
+                            delay = min(delay, max(0, deadline - now))
+                        if delay:
+                            await asyncio.sleep(delay)
+                    if strict_timeout and deadline is not None and time.perf_counter() >= deadline:
+                        return False
                     next_tick += period
                     frame = env.step(buttons, 1)
                     stepped += 1
                     publish(frame)
                     observe()
+                    return True
 
                 decision = 0
                 while True:
@@ -189,13 +193,22 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                             try:
                                 if period is None:
                                     for _ in range(held):
+                                        if strict_timeout and deadline is not None and time.perf_counter() >= deadline:
+                                            status = "timeout"
+                                            break
                                         frame = env.step(buttons, 1)
                                         stepped += 1
                                         publish(frame)
                                         observe()
+                                        if strict_timeout:
+                                            await asyncio.sleep(0)
                                 else:
                                     for _ in range(held):
-                                        await tick(buttons)
+                                        if not await tick(buttons):
+                                            status = "timeout"
+                                            break
+                                if status == "timeout":
+                                    break
                             finally:
                                 executed = stepped - action_start
                                 if executed:
@@ -210,7 +223,11 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                                     history.write(json.dumps(record) + "\n")
                                     latency = 0  # Count policy time only once.
                         calls += 1
-                        status = "played" if stepped - action_phase_start == sum(n for _, n, _ in batch) else "frame_limit"
+                        if status != "timeout":
+                            status = ("played" if stepped - action_phase_start == sum(n for _, n, _ in batch)
+                                      else "frame_limit")
+                        if status == "timeout":
+                            break
                     except TimeoutError as exc:
                         status, error = "timeout", str(exc) or "Wall-clock timeout reached before the model answered."
                         break

@@ -3,12 +3,61 @@
 Small synchronous Python interface to Open8 for Celeste Classic rollouts.
 Use it from this source checkout; the native library and cartridge stay here.
 
+## Getting started
+
+On a new machine (macOS or Linux; the VM harness prefers ARM for speed), one shell:
+
 ```sh
-git submodule update --init --recursive
-uv sync
-make -j4  # requires a C compiler and CMake; downloads/builds SDL3 if absent
-uv run python -m unittest discover -s tests
+git clone --recursive <repo> celestebench && cd celestebench  # or: git submodule update --init --recursive
+uv sync --extra llm --extra mcp      # installs Python deps (Tau + MCP server)
+make -j4                             # builds the emulator; needs clang/CMake
+uv run --extra llm python -m unittest discover -s tests   # everything should pass
 ```
+
+Provide one API key per provider family as environment variables; the viewer
+process reads them, nothing is stored:
+
+```sh
+export OPENCODE_GO_API_KEY=sk-...   # https://opencode.ai/zen — the default preset
+# also supported: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, MISTRAL_API_KEY
+```
+
+Start the viewer and open `http://localhost:8123/evals`:
+
+```sh
+uv run --extra llm python -m web.viewer
+```
+
+## Launching evals from the UI
+
+1. Click **new eval**.
+2. Pick a **harness** on the right: `CelesteBench Harness` for API models, or
+   `Codex CLI (Lima VM)` (log it in first — see below).
+3. Build runs on the left: each row is a model with its own `reasoning effort`
+   and `timeout (s)` (game-engine budget, starts at the first decision).
+   **+ add run** duplicates the previous row's settings; ✕ removes it. The same
+   model twice with different efforts is normal usage.
+4. Adjust the preset/API/base URL/key env only if needed — model families
+   (`claude…`, `gpt…`, `gemini…`, the Mistral family) auto-route to their
+   official API on default endpoints.
+5. **launch eval(s)**. Cards track each run live; open one to inspect its
+   replay (video, actions, CoT) in the runs view. Stop anytime.
+
+Codex harness, once per machine: create and authenticate the VM.
+
+```sh
+uv run --extra mcp python examples/codex_vm.py start
+uv run --extra mcp python examples/codex_vm.py login   # device code; persists in the VM
+```
+
+Back in the UI, select `Codex CLI (Lima VM)`, set the **task prompt**, launch.
+The viewer boots the VM, opens the tunnel and runs one Codex evaluation at a
+time; VM Codex auth sticks until you log it out. Stop the VM with
+`examples/codex_vm.py stop` when finished to free memory.
+
+## Python interface
+
+An `Open8` environment drives the game directly when you want scripted rollouts:
 
 ```python
 from pathlib import Path
@@ -36,8 +85,8 @@ with Open8() as env:  # loads Celeste Classic, with a fixed initial seed
   States require the same cartridge and emulator version. Celeste replay is
   tested pixel-for-pixel; arbitrary cartridges using wall-clock time may diverge.
   The old `CBST` file format is no longer supported.
-- `record(path)` writes every stepped frame to a lossless H.264 MP4 with mono
-  AAC game audio. Frames use yuv444p/qp 0 and nearest-neighbor 4x upscaling
+- `record(path)` writes every stepped frame to a lossless H.264 MP4. Frames use
+  yuv444p/qp 0 and nearest-neighbor 4x upscaling
   (512x512), so playback stays crisp at the cart's native 30/60 fps. Recording
   finalizes even when the
   body raises. Step at least
@@ -54,7 +103,7 @@ This is the emulator interface, without a reward function or a Gym wrapper.
 a policy that takes the last frame and returns `(buttons, frames)`, `("wait", frames)`, or a list — sync or
 async. It writes `rollout.mp4`, an `actions.jsonl` log with latencies, and a final
 `checkpoint.state` into a fresh `output` directory. While running, `live.png` and
-`live.pcm` expose the latest frame and 22.05 kHz mono audio to the viewer. The entire action batch is validated before
+`live.png` exposes the latest frame to the viewer. The entire action batch is validated before
 execution. `max_actions` bounds every policy, including non-LLM policies. There is no screenshot
 between actions in a batch. The initial observation advances and records one neutral frame.
 `timeout` is the wall-clock budget for the whole rollout: when it expires the pending policy call
@@ -136,18 +185,44 @@ uv run --extra llm python -m web.viewer  # http://localhost:8123
 ```
 
 Open **evaluations** (or `/evals`), then use **new eval** to open the evaluation
-dialog. The runs page stays focused on replay and inspection. The left pane takes
-one model per line (commas also work); every listed model becomes its own evaluation run with
-the settings shared on the right, so a batch of models is a single launch. The
-launch button and the counter preview how many runs a batch creates. `timeout (s)`
-is the wall-clock budget for the whole run. Presets
-cover OpenCode Go, OpenAI, Anthropic, Google and Mistral;
+dialog. The runs page stays focused on replay and inspection. The dialog's
+builder shows one row per run: a model with its own reasoning effort and its own
+`timeout (s)` wall-clock budget, so the same model can be evaluated at several
+effort levels in one launch. **+ add run** duplicates the previous row's effort
+and timeout with an empty model; the ✕ button removes a row. The host-side
+settings stay shared on the right, so a batch of runs remains a single launch
+and the launch button previews how many runs it creates.
+
+`timeout (s)` is per run and, for every harness, it is the game-engine budget:
+the countdown starts with the engine's first decision, not while a harness
+boots its emulator, VM or provider before anything visible happens (the card
+says so while it is the case).
+
+**harness** chooses how the model plays. `CelesteBench Harness` is the default and
+covers API models with the settings below. `Codex CLI (Lima VM)` starts Codex
+inside the durable `celestebench-codex` Lima VM (`examples/codex_vm.py`, already
+brought online here) and plays against our MCP game server: it needs one
+`task prompt` instead of API settings, keeps the game, scorer and visibility on
+the host, and runs one Codex evaluation at a time on the shared VM. Run
+`examples/codex_vm.py login` once to authenticate the VM's Codex user.
+
+With Tau, presets cover OpenCode Go, OpenAI, Anthropic, Google and Mistral;
 model IDs and endpoints remain editable for other compatible services or local
 servers. The five protocols use Tau's existing provider adapters. Choose a model
-that accepts images and tool calls. Credentials come from an environment variable
-in the viewer process or a temporary password field, which is cleared after launch.
-They are passed to the child process through its environment, not command arguments
-or the saved configuration.
+that accepts images and tool calls. Well-known model families are routed
+automatically on official endpoints (`claude…` to Anthropic, `gpt…`/`o3…` to
+OpenAI, `gemini…` to Google, and the Mistral family to Mistral), each using its
+own key environment variable — so mixing families in one batch needs no
+`@provider` tags. A custom base URL (like OpenCode Go or a local server) serves
+every family itself and is never overridden. Tags still force a route:
+`model@openai`, `@anthropic`, `@google` or `@mistral` send the line to that
+official endpoint and key env, while protocol tags such as
+`model@openai-completions` only swap the API of the dialog endpoint. Provider
+tags reroute before launch and the batch is refused when a tag's key env is
+unset. Credentials come from an environment variable in the viewer process or a
+temporary password field, which is cleared after launch. They are passed to the
+child process through its environment, not command arguments or the saved
+configuration.
 
 The same viewer follows each evaluation's observations, actions and available CoT,
 with recorded-decision, frame, elapsed-time and reported-token counters. Select an
@@ -176,8 +251,6 @@ Runs without a finished video remain visible. Failed and interrupted attempts st
 in the original decision list, even after the last video frame. Clicking one pauses
 playback and shows its received reasoning and requested actions in the original
 right-hand panels. Playing the video again resumes synchronized selection.
-Active runs expose a **sound** button beside their live game stream. Browsers require
-that click before audio playback; finished MP4s contain the same audio track.
 
 Omitting `--output` in `examples/llm.py` creates a fresh `runs/MODEL/TIMESTAMP`
 directory, so repeated runs never replace each other.
@@ -196,3 +269,97 @@ request without a recorded cause is marked interrupted, not automatically timeou
 Reasoning discarded by the old logger cannot be recovered. The pages and styles
 live in `web/static/`; `web/viewer.py` serves the local API/video, and
 `web/evals.py` starts the existing CLI in separate processes.
+
+## MCP
+
+Install the optional server dependency with `uv sync --extra mcp` (add
+`--extra llm` to also keep Tau installed). The emulator remains usable without
+either extra.
+
+```sh
+uv run --extra mcp python -m celestebench.mcp --output runs/mcp/first --timeout 300
+```
+
+This starts a stdio MCP server for a trusted local client. Its only tools are
+`observe()` and `play(actions)`. Call `observe` first; `play` accepts the same
+button masks and explicit waits as Tau and returns up to three PNG images:
+
+```json
+{"actions":[{"buttons":18,"frames":4},{"action":"wait","frames":8},{"buttons":2,"frames":4}]}
+```
+
+The first tool call starts one episode. By default it runs at 30 FPS with
+buttons released while the client thinks. `--lite` pauses simulation between
+actions. `--frames` caps simulated frames, `--max-frames` bounds each hold
+(default 30), and `--max-images` controls the returned image count (default 3).
+There is no separate action-count cap. The whole sequence is validated before
+submission, and the episode deadline also cuts an executing sequence. This
+strict deadline is opt-in in the shared rollout; existing Tau defaults are
+unchanged.
+
+Repeated `observe` calls return the current decision's observation, not a live
+peek during inference. Concurrent calls are rejected. The image limit applies
+to each tool response; the external harness controls its own retained context
+and system instructions. The server cannot reset
+or restore an episode through MCP, and exposes no filesystem or Lua tools.
+The operator chooses budgets and output paths at process launch. Rollout video,
+actions and decisions use the existing viewer format; this adds control access,
+not a room scorer or access to the external model's private reasoning.
+
+For a client in a VM, keep the MCP server on the host and use authenticated
+Streamable HTTP through an SSH tunnel:
+
+```sh
+# Set CELESTEBENCH_MCP_TOKEN to a fresh secret in the server environment.
+uv run --extra mcp python -m celestebench.mcp --transport http \
+  --port 8124 --output runs/mcp/remote --timeout 300
+```
+
+HTTP binds only to `127.0.0.1` and requires that bearer token. Do not give an
+untrusted client the stdio launch command on your host: MCP itself is not a
+sandbox. Each server process owns one episode; use separate processes and ports
+for separate runs.
+
+## Codex CLI in a Lima VM
+
+`examples/codex_vm.py` prepares a dedicated Linux ARM VM and connects its Codex
+CLI to the host MCP server. The preset uses Lima with VZ on macOS (or QEMU elsewhere), 2 CPUs, 2 GiB RAM,
+and a 6 GiB virtual disk. Those are configured limits, not measured resident
+memory or total host disk consumption; image caches and rollout videos use
+additional storage. The preset installs Codex CLI 0.153.4, with no Docker or GUI.
+
+```sh
+uv sync --extra mcp
+uv run --extra mcp python examples/codex_vm.py start
+uv run --extra mcp python examples/codex_vm.py login
+uv run --extra mcp python examples/codex_vm.py run \
+  --output runs/codex-vm/first --timeout 300 \
+  --prompt 'Play Celeste Classic. First call the celeste observe tool, then use play to climb as many rooms as possible. Continue until the episode ends.'
+uv run --extra mcp python examples/codex_vm.py stop
+```
+
+`start` downloads/provisions the VM the first time. `login` authenticates inside
+the guest using a device code; no host Codex authentication files are copied.
+Alternatively, supply `CODEX_API_KEY` to the launcher for API authentication.
+That credential is available to Codex inside the guest: use a dedicated key
+when testing an untrusted agent. `run` also starts the VM if necessary, creates
+a fresh MCP token, starts the host MCP process, opens the reverse SSH tunnel,
+and sends the task to `codex exec`. `--prompt-file` accepts a task file;
+`--model` selects an accessible model without changing your host configuration.
+`--lite`, `--frames` and `--max-frames` are passed to the game server.
+
+The run directory contains the task/configuration and Codex JSONL output;
+`rollout/` contains the game's video and action/decision logs. The launcher
+cleans up its MCP and SSH processes. Stop the dedicated VM explicitly when done
+to release its memory; its disk remains for the next run.
+
+The guest has no host directory mounts, SSH agent forwarding or automatic
+guest port forwarding. Codex runs as `bench`, without sudo. Root-owned firewall
+rules restrict this user to the MCP tunnel, DNS and public HTTPS, rejecting
+private/LAN destinations and IPv6. Public HTTPS is not restricted to a provider
+domain allowlist. These controls do not protect credentials deliberately given
+to the guest, and are not a guarantee against VM or guest-kernel exploits.
+
+The preset and launcher have local validation/tests; a real VM boot, guest
+firewall check and authenticated Codex run still need to be exercised on the
+target machine. No VM image or model request is needed to run the Python tests.

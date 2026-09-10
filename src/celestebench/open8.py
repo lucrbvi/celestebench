@@ -38,15 +38,12 @@ class Open8:
             ("step", [C.c_uint32, C.c_uint8], C.c_int),
             ("frame_ms", [], C.c_uint32),
             ("framebuffer", [C.POINTER(C.c_uint8)], None),
-            ("audio_samples", [], C.c_uint32),
-            ("audio", [C.POINTER(C.c_int16)], None),
         ):
             fn = getattr(self._lib, f"shim_{name}")
             fn.argtypes, fn.restype = args, result
         if self._lib.shim_init() != 0:
             raise RuntimeError("Open8 initialization failed (only one environment per process)")
         self._history = bytearray()
-        self.audio = np.empty(0, dtype=np.int16)
         self._video = None
         try:
             self.reset()
@@ -61,15 +58,7 @@ class Open8:
         if self._lib.shim_load_cart(str(self.cart).encode()) != 0:
             raise RuntimeError(f"could not load {self.cart}")
         self._history.clear()
-        self.audio = np.empty(0, dtype=np.int16)
         return self.framebuffer
-
-    def _pull_audio(self) -> np.ndarray:
-        samples = self._lib.shim_audio_samples()
-        audio = np.empty(samples, dtype=np.int16)
-        if samples:
-            self._lib.shim_audio(audio.ctypes.data_as(C.POINTER(C.c_int16)))
-        return audio
 
     @property
     def framebuffer(self) -> np.ndarray:
@@ -90,23 +79,14 @@ class Open8:
             if self._lib.shim_step(frames, buttons) != frames:
                 raise RuntimeError("Open8 failed to advance")
             self._history.extend(bytes([buttons]) * frames)
-            self.audio = self._pull_audio()
         else:
-            output, stream, audio_stream = self._video
-            chunks = []
+            output, stream = self._video
             for _ in range(frames):
                 if self._lib.shim_step(1, buttons) != 1:
                     raise RuntimeError("Open8 failed to advance")
                 self._history.append(buttons)
                 big = np.repeat(np.repeat(self.framebuffer, UPSCALE, 0), UPSCALE, 1)
                 output.mux(stream.encode(av.VideoFrame.from_ndarray(big, format="rgba")))
-                audio = self._pull_audio()
-                chunks.append(audio)
-                if audio.size:
-                    frame = av.AudioFrame.from_ndarray(audio.reshape(1, -1), format="s16", layout="mono")
-                    frame.sample_rate = 22050
-                    output.mux(audio_stream.encode(frame))
-            self.audio = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int16)
         return self.framebuffer
 
     def save_state(self) -> bytes:
@@ -120,18 +100,16 @@ class Open8:
         if not isinstance(state, bytes) or any(button > 63 for button in state):
             raise ValueError("state must be bytes containing button masks 0..63")
         self.reset()
-        self.audio = np.empty(0, dtype=np.int16)
         for buttons, group in groupby(state):
             count = sum(1 for _ in group)
             if self._lib.shim_step(count, buttons) != count:
                 raise RuntimeError("Open8 replay failed")
             self._history.extend(bytes([buttons]) * count)
-        self._pull_audio()  # Replaying a checkpoint must not leak into a recording.
         return self.framebuffer
 
     @contextmanager
     def record(self, path: str | Path):
-        """Write every stepped frame to an MP4 with the cartridge audio.
+        """Write every stepped frame to an MP4.
         Frames are upscaled 4x with nearest-neighbor so playback stays crisp."""
         if self._lib is None or self._video is not None:
             raise RuntimeError("environment is closed or already recording")
@@ -140,15 +118,12 @@ class Open8:
             stream.width = stream.height = UPSCALE * 128
             stream.pix_fmt = "yuv444p"
             stream.options = {"qp": "0"}  # Lossless: pixel art survives 4:4:4 fine.
-            audio_stream = output.add_stream("aac", rate=22050)
-            audio_stream.layout = "mono"
-            self._video = output, stream, audio_stream
+            self._video = output, stream
             try:
                 yield self
             finally:
                 self._video = None
                 output.mux(stream.encode())
-                output.mux(audio_stream.encode())
 
     def close(self) -> None:
         if self._lib is not None:
