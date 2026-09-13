@@ -679,8 +679,8 @@ class Handler(BaseHTTPRequestHandler):
                     modified = current
                 if done.is_file():
                     break
-                # Boot can take minutes (a Codex VM); keep the stream open while
-                # the job runs instead of forcing a page reload for a late frame.
+                # Boot can take a while (starting Codex); keep the stream open
+                # while the job runs instead of forcing a reload for a late frame.
                 if running is not None and not running():
                     break
                 time.sleep(1 / 30)

@@ -22,17 +22,6 @@ ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "examples" / "llm.py"
 
 
-def _find_limactl() -> Path:
-    found = shutil.which("limactl")
-    if found:
-        return Path(found)
-    for probe in ("/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"):
-        if Path(probe).is_file():  # brew installs may be missing from PATH
-            return Path(probe)
-    return Path("limactl")  # keeps PATH failures visible in the error
-
-
-LIMACTL = _find_limactl()
 _lock = threading.RLock()
 _jobs = {}
 _processes = {}
@@ -57,7 +46,7 @@ def _harness(name):
     return HARNESSES.get(name) or HARNESSES["tau"]
 
 
-_REQUIREMENTS = {"limactl": lambda: LIMACTL.is_file()}
+_REQUIREMENTS = {"codex": lambda: shutil.which("codex") is not None}
 
 
 def _require(harness):
@@ -165,7 +154,7 @@ def _progress(job):
         return
     if job["status"] == "running" and not engine.is_file():
         # Countdown starts when the game actually runs, not while any harness
-        # boots its emulator, VM or provider before the first decision.
+        # boots its emulator or provider before the first decision.
         job.update(decisions=0, frames=0, elapsed=0, tokens=None, engine=False)
         return
     job["engine"] = True
@@ -195,7 +184,7 @@ def _watch(job, proc, secret):
             job["error"] = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception): ", "", last)
         harness = _harness(job.get("harness"))
         if job["status"] == "failed" and harness.trace:
-            # The guest CLI reports its own whole failures in the JSON trace
+            # The external CLI reports its own whole failures in the JSON trace
             # (e.g. an authentication problem), which reads much better than the
             # process traceback.
             messages = [row.get("message") for row in _rows(Path(job["_folder"]) / harness.trace)
@@ -240,6 +229,14 @@ def _launch(job, options, secret):
     threading.Thread(target=_watch, args=(job, proc, secret), daemon=True).start()
 
 
+def _concurrency(harness):
+    """Codex shares one ChatGPT login without an API key, so it runs one at a time
+    there and in parallel once CODEX_API_KEY lets every run authenticate on its own."""
+    if harness.key == "codex" and not os.environ.get("CODEX_API_KEY"):
+        return 1
+    return harness.concurrency
+
+
 def _pump():
     """Start queued evaluations in submission order, up to each harness's cap."""
     with _lock:
@@ -251,8 +248,9 @@ def _pump():
             if job["status"] != "queued":
                 continue
             harness = _harness(job.get("harness"))
-            # Capped harnesses share the same VM or port; wait for a free slot.
-            if harness.concurrency and busy.get(harness.key, 0) >= harness.concurrency:
+            # Capped harnesses share a resource; wait for a free slot.
+            limit = _concurrency(harness)
+            if limit and busy.get(harness.key, 0) >= limit:
                 continue
             options, secret = job.pop("_options", None), job.pop("_secret", None)
             if options is None:
@@ -351,8 +349,8 @@ def _enqueue(runs, harness, plans):
                    "elapsed": 0, "tokens": None, "started_at": time.time(),
                    "_folder": str(folder), "_meta": str(meta)}
             # Options and the secret stay in memory only; never persisted to disk.
-            # Capped harnesses queue once their share of the VM is running.
-            limit = HARNESSES[harness].concurrency
+            # Capped harnesses queue once their share of the resource is running.
+            limit = _concurrency(HARNESSES[harness])
             running = sum(1 for _id in _processes
                           if _harness(_jobs[_id].get("harness")).key == harness)
             if limit and running >= limit:

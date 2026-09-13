@@ -39,7 +39,7 @@ class Harness:
     options: tuple[Field, ...] = ()
     command: tuple[str, ...] = ()
     note: str = ""
-    trace: str = ""  # guest JSON trace, e.g. codex.jsonl
+    trace: str = ""  # external CLI JSON trace, e.g. codex.jsonl
     login_hint: str = ""
     concurrency: int = 0  # 0 = unlimited; N = at most N runs at once
     nested: bool = False  # rollout lives one directory below the run folder
@@ -82,16 +82,14 @@ HARNESSES: dict[str, Harness] = {
     ),
     "codex": Harness(
         key="codex",
-        label="Codex CLI (Lima VM)",
-        script="examples/codex_vm.py",
-        command=("run",),
-        concurrency=4,
+        label="Codex CLI",
+        script="examples/codex.py",
         nested=True,
         trace="codex.jsonl",
-        requires="limactl",
-        note="Runs inside the durable Lima VM (examples/codex_vm.py start). Up to four "
-             "evaluations share it at once, each as its own VM user and port; needs "
-             "CODEX_API_KEY in the viewer environment.",
+        requires="codex",
+        note="Runs the host Codex CLI in an empty read-only workspace with shell "
+             "network off. Uses CODEX_API_KEY when set (parallel); otherwise your "
+             "`codex login` ChatGPT session, one run at a time.",
         run=(
             Field("model", "model", required=True),
             Field("thinking_level", "reasoning", "choice", "low", choices=THINKING_LEVELS,

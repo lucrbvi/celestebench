@@ -9,10 +9,6 @@ from unittest.mock import patch
 
 from web import evals
 
-LIMACTL_OK = Path(__file__)  # an existing file passes the Lima check
-MISSING_LIMACTL = Path(__file__).parent / "missing" / "limactl"
-
-
 class FakeProcess:
     def __init__(self, args, **kwargs):
         self.args, self.kwargs, self.returncode = args, kwargs, 0
@@ -195,7 +191,7 @@ class EvalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
                 evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
-                patch.object(evals, "LIMACTL", LIMACTL_OK):
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             jobs = evals.start_eval({"harness": "codex", "models": ["a", "b", "c", "d", "e"],
                                      "prompt": "x", "timeout": 5}, Path(directory))
             stopped = evals.stop_eval(jobs[4]["id"])
@@ -305,7 +301,7 @@ class EvalTests(unittest.TestCase):
             self.assertLess(job["elapsed"], 30, "boot time must stay out of the game clock")
             self.assertEqual(job["frames"], 3)
 
-    def test_codex_jobs_cap_at_four_and_queue_the_rest(self):
+    def test_codex_jobs_launch_without_a_cap(self):
         gate = threading.Event()
 
         class Blocking(FakeProcess):
@@ -315,18 +311,36 @@ class EvalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
-                patch.object(evals, "LIMACTL", LIMACTL_OK):
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
+                patch.dict(evals.os.environ, {"CODEX_API_KEY": ""}):
             jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"],
                                      "prompt": "x", "timeout": 5}, Path(directory))
             self.assertEqual([job["status"] for job in jobs],
-                             ["running", "running", "running", "running", "queued"])
-            evals.stop_eval(jobs[0]["id"])
-            self.wait_until(lambda: evals._jobs[jobs[4]["id"]]["status"] == "running")
+                             ["running", "queued", "queued", "queued", "queued"])
             gate.set()
             self.wait_until(lambda: all(evals._jobs[job["id"]]["status"] != "running"
                                         for job in jobs))
 
-    def test_codex_harness_launches_the_vm_cli_with_prompt_and_budgets(self):
+    def test_codex_jobs_run_in_parallel_with_an_api_key(self):
+        gate = threading.Event()
+
+        class Blocking(FakeProcess):
+            def communicate(self):
+                gate.wait(2)
+                return None, ""
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
+                patch.dict(evals.os.environ, {"CODEX_API_KEY": "k"}):
+            jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"],
+                                     "prompt": "x", "timeout": 5}, Path(directory))
+            self.assertEqual([job["status"] for job in jobs], ["running"] * 5)
+            gate.set()
+            self.wait_until(lambda: all(evals._jobs[job["id"]]["status"] != "running"
+                                        for job in jobs))
+
+    def test_codex_harness_launches_the_local_cli_with_prompt_and_budgets(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -335,19 +349,17 @@ class EvalTests(unittest.TestCase):
             return process
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
-                patch.object(evals, "LIMACTL", LIMACTL_OK):
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             jobs = evals.start_eval({"harness": "codex", "model": "gpt-5.2", "frames": 9,
                                      "prompt": "Play the game.", "timeout": 30}, Path(directory))
             job = jobs[0]
             self.assertEqual(job["harness"], "codex")
             args = processes[0].args
             self.assertIn(str(evals.ROOT / evals.HARNESSES["codex"].script), args)
-            self.assertIn("run", args)
             self.assertIn("--model=gpt-5.2", args)
             self.assertIn("--prompt=Play the game.", args)
             self.assertIn("--timeout=30", args)
             self.assertIn("--frames=9", args)
-            self.assertNotIn("api", args)
             self.wait_until(lambda: evals._jobs[jobs[0]["id"]]["status"] != "running")
             final = next(j for j in evals.list_evals(Path(directory)) if j["id"] == jobs[0]["id"])
             self.assertEqual(final["status"], "completed")
@@ -362,7 +374,7 @@ class EvalTests(unittest.TestCase):
             return process
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
-                patch.object(evals, "LIMACTL", LIMACTL_OK):
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             jobs = evals.start_eval({"harness": "codex", "prompt": "x", "max_frames": 5, "evals": [
                 {"model": "gpt-5.2", "thinking_level": "high", "timeout": 45},
             ]}, Path(directory))
@@ -389,7 +401,7 @@ class EvalTests(unittest.TestCase):
     def test_codex_harness_validation_starts_nothing(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(evals.subprocess, "Popen") as launch, \
-                patch.object(evals, "LIMACTL", LIMACTL_OK):
+                patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             for bad in ({"harness": "codex", "model": "m"},
                         {"prompt": "x"},
                         {"harness": "codex", "model": "m", "prompt": "x", "api": "anthropic"},
@@ -400,11 +412,11 @@ class EvalTests(unittest.TestCase):
             launch.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_codex_harness_requires_lima_before_touching_the_filesystem(self):
+    def test_codex_harness_requires_codex_before_touching_the_filesystem(self):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(evals.subprocess, "Popen") as launch, \
-                patch.object(evals, "LIMACTL", MISSING_LIMACTL):
-            with self.assertRaisesRegex(RuntimeError, "Lima"):
+                patch.object(evals.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "codex"):
                 evals.start_eval({"harness": "codex", "model": "m", "prompt": "x"}, Path(directory))
             launch.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])

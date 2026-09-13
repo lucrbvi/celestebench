@@ -1,6 +1,6 @@
 # celestebench
 
-CelesteBench is an evaluation for AI models (LLMs and others in the future) to mesure how well they do in real-time video games. I am focusing on Celeste Classic because it is a small open-source and beloved game.
+CelesteBench is an evaluation for AI models (LLMs and others in the future) to mesure how well they perform in real-time video games. I am focusing on Celeste Classic because it is a small open-source and beloved game.
 
 ## Install
 
