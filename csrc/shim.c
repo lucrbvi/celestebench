@@ -1,4 +1,6 @@
 #include <SDL3/SDL.h>
+#include <math.h>
+#include <stdint.h>
 // Access the upstream frame loop and VM without its interactive main().
 #include "core.c"
 
@@ -10,6 +12,162 @@ void init_api(lua_State* L)
 }
 
 static SDL_Renderer* renderer;
+
+typedef struct shim_game_state
+{
+    int32_t room;
+    int32_t alive;
+    float feet_y;
+    int32_t grounded;
+    float spawn_feet_y;
+    float exit_feet_y;
+    int32_t deaths;
+} shim_game_state_t;
+
+static shim_game_state_t game_state;
+static int celeste_cart;
+static float spawn_feet[31];
+
+static int global_is_function(const char* name)
+{
+    lua_getglobal(vm, name);
+    int result = lua_isfunction(vm, -1);
+    lua_pop(vm, 1);
+    return result;
+}
+
+static void find_spawn_feet(void)
+{
+    for (int room = 0; room < 31; room++)
+    {
+        int x = room % 8;
+        int y = room / 8;
+        spawn_feet[room] = NAN;
+        for (int ty = 0; ty < 16; ty++)
+        {
+            for (int tx = 0; tx < 16; tx++)
+            {
+                int row = y * 16 + ty;
+                int address = row < 32
+                    ? 0x2000 + row * 128 + x * 16 + tx
+                    : 0x1000 + (row - 32) * 128 + x * 16 + tx;
+                if (pico8_ram[address] == 1)
+                {
+                    spawn_feet[room] = (float)((ty + 1) * 8);
+                    ty = 16;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static int find_player(void)
+{
+    int top = lua_gettop(vm);
+    lua_getglobal(vm, "objects");
+    int objects = lua_gettop(vm);
+    lua_getglobal(vm, "player");
+    int player_type = lua_gettop(vm);
+
+    size_t count = lua_rawlen(vm, objects);
+    for (size_t i = 1; i <= count; i++)
+    {
+        lua_rawgeti(vm, objects, (int)i);
+        if (lua_istable(vm, -1))
+        {
+            lua_getfield(vm, -1, "type");
+            int match = lua_rawequal(vm, -1, player_type);
+            lua_pop(vm, 1);
+            if (match)
+            {
+                lua_remove(vm, objects);
+                lua_remove(vm, player_type - 1);
+                return lua_gettop(vm);
+            }
+        }
+        lua_pop(vm, 1);
+    }
+
+    lua_settop(vm, top);
+    return 0;
+}
+
+static float player_field(int player, const char* name)
+{
+    lua_getfield(vm, player, name);
+    float value = (float)fix32_to_double((fix32_t)lua_tonumber(vm, -1));
+    lua_pop(vm, 1);
+    return value;
+}
+
+static int player_is_grounded(int player)
+{
+    lua_getfield(vm, player, "is_solid");
+    if (!lua_isfunction(vm, -1))
+    {
+        lua_pop(vm, 1);
+        return 0;
+    }
+
+    lua_pushnumber(vm, fix32_from_int(0));
+    lua_pushnumber(vm, fix32_from_int(1));
+    if (lua_pcall(vm, 2, 1, 0) != LUA_OK)
+    {
+        lua_pop(vm, 1);
+        return 0;
+    }
+
+    int grounded = lua_toboolean(vm, -1);
+    lua_pop(vm, 1);
+    return grounded;
+}
+
+const shim_game_state_t* shim_game_state(void)
+{
+    if (!celeste_cart)
+    {
+        return NULL;
+    }
+
+    int top = lua_gettop(vm);
+    lua_getglobal(vm, "room");
+    if (!lua_istable(vm, -1))
+    {
+        lua_settop(vm, top);
+        return NULL;
+    }
+    lua_getfield(vm, -1, "x");
+    int room_x = fix32_to_int((fix32_t)lua_tointeger(vm, -1));
+    lua_pop(vm, 1);
+    lua_getfield(vm, -1, "y");
+    int room_y = fix32_to_int((fix32_t)lua_tointeger(vm, -1));
+    lua_pop(vm, 1);
+    lua_pop(vm, 1);
+
+    int room = room_x % 8 + room_y * 8;
+    int player = find_player();
+    int alive = player != 0;
+    float feet_y = NAN;
+    int grounded = 0;
+    if (alive)
+    {
+        feet_y = player_field(player, "y") + 8.0f;
+        grounded = player_is_grounded(player);
+    }
+
+    game_state.room = room;
+    game_state.alive = alive;
+    game_state.feet_y = feet_y;
+    game_state.grounded = grounded;
+    game_state.spawn_feet_y = room >= 0 && room < 31 ? spawn_feet[room] : NAN;
+    game_state.exit_feet_y = 4.0f;
+    lua_getglobal(vm, "deaths");
+    game_state.deaths = fix32_to_int((fix32_t)lua_tointeger(vm, -1));
+    lua_pop(vm, 1);
+    lua_settop(vm, top);
+    return &game_state;
+}
 
 static void run_frame(void)
 {
@@ -89,6 +247,7 @@ void shim_quit(void)
     destroy_cart(get_cart());
     destroy_memory();
     renderer = NULL;
+    celeste_cart = 0;
 
     SDL_Quit();
 }
@@ -110,6 +269,14 @@ int shim_load_cart(const char* path)
     if (!run_cart_deterministic())
     {
         return -3;
+    }
+
+    celeste_cart = global_is_function("level_index") &&
+                   global_is_function("load_room") &&
+                   global_is_function("solid_at");
+    if (celeste_cart)
+    {
+        find_spawn_feet();
     }
 
     return 0;

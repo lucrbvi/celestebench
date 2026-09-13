@@ -1,46 +1,25 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>evaluations · celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
 <body>
-<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/">runs</a><a href="/evals" aria-current="page">evaluations</a><button id="newEvalToggle" aria-expanded="false" aria-haspopup="dialog" aria-controls="evalOverlay">new eval</button></nav></header>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/runs">runs</a><a href="/evals" aria-current="page">evaluations</a><a href="/leaderboard">leaderboard</a><button id="newEvalToggle" aria-expanded="false" aria-haspopup="dialog" aria-controls="evalOverlay">new eval</button></nav></header>
 <div id="evalOverlay" hidden>
-  <form id="evalForm" onsubmit="return submitEval(event)">
+  <form id="evalForm" autocomplete="off" onsubmit="return submitEval(event)">
     <div id="evalDialog" role="dialog" aria-modal="true" aria-label="new evaluation">
       <div class="dlg-head"><h2>new evaluation</h2><button type="button" id="evalClose" aria-label="close">✕</button></div>
       <div class="dlg-body">
         <div class="col">
-          <div id="runHeader" class="run-row run-head" hidden>
-            <span>model</span><span class="effort-col">reasoning effort</span><span>timeout (s)</span><span></span>
-          </div>
+          <div id="runHeader" class="run-row run-head" hidden></div>
           <div id="runRows"></div>
           <button type="button" id="addRun" title="Duplicate the last row's settings with an empty model">+ add run</button>
         </div>
         <div class="col">
           <div class="formgrid">
-            <label>harness <select id="evalHarness"><option value="tau">CelesteBench Harness</option><option value="codex">Codex CLI (Lima VM)</option></select></label>
+            <label>harness <select id="evalHarness"></select></label>
           </div>
-          <div id="codexFields" hidden>
-            <label>task prompt<textarea id="evalPrompt" rows="6" spellcheck="false" placeholder="Play Celeste Classic." title="Sent to the Codex CLI working against our MCP game server"></textarea></label>
-            <div class="meta">Runs inside the durable Lima VM (examples/codex_vm.py start/setup/login). Only one Codex evaluation at a time; the game streams the same way.</div>
-          </div>
-          <div id="tauFields">
-            <div class="formgrid">
-              <label>preset <select id="evalPreset"><option value="opencode-go">OpenCode Go</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option><option value="mistral">Mistral</option><option value="custom">custom</option></select></label>
-              <label>API <select id="evalApi"><option value="openai-responses">OpenAI Responses</option><option value="openai-completions">OpenAI Completions</option><option value="anthropic">Anthropic</option><option value="google-generative-ai">Google Generative AI</option><option value="mistral-conversations">Mistral Conversations</option></select></label>
-              <label>base URL <input id="evalBaseUrl" type="url" required value="https://opencode.ai/zen/go/v1"></label>
-              <label>key env name <input id="evalKeyEnv" value="OPENCODE_GO_API_KEY"></label>
-              <label>API key <input id="evalKey" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="optional"></label>
-              <label>max frames / action <input id="evalFrames" type="number" min="1" value="30" title="Maximum frames one action holds a button"></label>
-              <label>max actions <input id="evalActions" type="number" min="1" value="4" title="Maximum actions the model may return per turn"></label>
-            </div>
-            <details id="advancedFields"><summary>advanced</summary><div class="formgrid">
-              <label>max images <input id="evalImages" type="number" min="1" value="3" title="Cap on images kept in context; providers reject more"></label><label>FPS <input id="evalFps" type="number" min="1" placeholder="empty = pause" title="Run the game in real time at this speed; leave empty to pause the game while the model thinks"></label>
-              <label>default reasoning effort <input id="evalEffort" value="low" title="Used by new rows"></label>
-              <label>Anthropic thinking tokens <input id="evalThinking" type="number" min="1024" placeholder="disabled" title="Applies to any run routed to Anthropic"></label>
-            </div></details>
-          </div>
+          <div id="harnessFields"></div>
         </div>
       </div>
-      <div class="dlg-foot"><span id="evalError"></span><span id="evalCapacity" class="meta"></span><button id="evalSubmit" type="submit" disabled>launch eval</button></div>
+      <div class="dlg-foot"><span id="evalError"></span><button id="evalSubmit" type="submit" disabled>launch eval</button></div>
     </div>
   </form>
 </div>
@@ -48,34 +27,43 @@
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-let evalJobs = [], polling = false;
+let evalJobs = [], polling = false, harnesses = {}, selected = null;
 const cards = new Map();
 
-async function jsonRequest(url, options) {
-  const response = await fetch(url, options);
+async function jsonRequest(url, options = {}) {
+  const signal = options.timeout ? AbortSignal.timeout(options.timeout) : undefined;
+  const response = await fetch(url, {...options, signal});
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw Error(data.error || `Request failed (${response.status})`);
   return data;
 }
 function jobMeta(job) {
-  return [`${job.decisions} decisions · ${job.frames} frames`,
-    job.engine === false ? "harness booting — game clock has not started"
-    : `${Number(job.elapsed).toFixed(1)}/${Number(job.timeout || 0).toFixed(0)}s · ${job.tokens == null ? "—" : job.tokens} tokens`];
+  const second = job.status === "queued" ? "waiting to start"
+    : job.status === "running" && job.engine === false ? "harness booting — game clock has not started"
+    : `${Number(job.elapsed).toFixed(1)}/${Number(job.timeout || 0).toFixed(0)}s · ${job.tokens == null ? "—" : job.tokens} tokens`;
+  return [`${job.decisions} decisions · ${job.frames} frames`, second];
+}
+function updateMeta(card, job) {
+  const [frames, detail] = jobMeta(job);
+  card.querySelector(".eval-frames").textContent = frames;
+  card.querySelector(".eval-detail").textContent = detail;
 }
 
 function buildCard(job) {
   const card = document.createElement("div");
   card.className = "card";
-  card.innerHTML = `<a class="button" href="/?run=${encodeURIComponent(job.name)}">${esc(job.model)}</a>
+  const open = job.run_ready !== false;
+  const title = open ? `<a class="button" href="/runs?run=${encodeURIComponent(job.name)}">${esc(job.model)}</a>`
+    : `<span>${esc(job.model)}</span>`;
+  card.innerHTML = `${title}
     <div class="eval-status ${esc(job.status)}">${esc(job.status)}</div>
-    <div class="meta"><span></span><br><span></span></div>
+    <div class="meta"><span class="eval-frames"></span><br><span class="eval-detail"></span></div>
     ${["running", "completed"].includes(job.status) ? `<progress max="${job.timeout || job.elapsed || 1}" value="${job.elapsed}" aria-label="evaluation progress"></progress>` : ""}
     ${job.status === "running" ? `<img class="eval-live" src="/live/${encodeURIComponent(job.name)}" alt="live game stream for ${esc(job.model)}">` : ""}
-    ${job.error ? `<details class="eval-error"><summary>${esc(job.error.length > 120 ? job.error.slice(0, 120) + "…" : job.error)}</summary><pre>${esc(job.error)}</pre></details>` : ""}`;
-  const [frames, time] = jobMeta(job);
-  const [framesNode, timeNode] = card.querySelectorAll(".meta span");
-  framesNode.textContent = frames;
-  timeNode.textContent = time;
+    ${job.error ? (job.error.length > 120
+      ? `<details class="eval-error"><summary>${esc(job.error.slice(0, 120))}…</summary><pre>${esc(job.error)}</pre></details>`
+      : `<div class="eval-error">${esc(job.error)}</div>`) : ""}`;
+  updateMeta(card, job);
   if (job.status === "running" || job.status === "queued") {
     const stop = document.createElement("button");
     stop.textContent = "stop";
@@ -92,10 +80,7 @@ function buildCard(job) {
 }
 
 function updateCard(card, job) {
-  const [frames, time] = jobMeta(job);
-  const [framesNode, timeNode] = card.querySelectorAll(".meta span");
-  if (framesNode.textContent !== frames) framesNode.textContent = frames;
-  if (timeNode.textContent !== time) timeNode.textContent = time;
+  updateMeta(card, job);
   const progress = card.querySelector("progress");
   if (progress) { progress.max = job.timeout || job.elapsed || 1; progress.value = job.elapsed; }
 }
@@ -108,7 +93,7 @@ function renderEvalJobs() {
   if (!box.children.length) box.textContent = "";
   const ordered = [];
   for (const job of evalJobs) {
-    const shape = job.status + (job.error ? "!" : "");
+    const shape = job.status + (job.error ? "!" : "") + (job.run_ready === false ? "0" : "1");
     let card = cards.get(job.id);
     if (!card || card.dataset.shape !== shape) {
       if (card) card.remove();
@@ -128,126 +113,223 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    evalJobs = (await jsonRequest("/api/evals")).filter(job => ["queued", "running"].includes(job.status));
+    evalJobs = (await jsonRequest("/api/evals", {timeout: 10000})).filter(job => ["queued", "running"].includes(job.status));
     renderEvalJobs();
     updateEvalPlan();
     $("pollError").textContent = "";
   } catch (error) { $("pollError").textContent = `Refresh failed: ${error.message}`; }
   finally { polling = false; }
 }
+
+/* The new-eval form is built from /api/harnesses, so a new external harness
+   only needs a backend entry: no change here or in the launch code. */
+const optionsOf = field => field.choices.map(choice => typeof choice === "string"
+  ? {value: choice, label: choice} : choice);
+function control(field, value) {
+  let input;
+  if (field.kind === "choice") {
+    input = document.createElement("select");
+    for (const choice of optionsOf(field)) {
+      const option = document.createElement("option");
+      option.value = choice.value; option.textContent = choice.label;
+      input.append(option);
+    }
+    if (value != null && value !== "") input.value = value;
+  } else if (field.kind === "bool") {
+    input = document.createElement("input");
+    input.type = "checkbox"; input.checked = !!value;
+  } else if (field.kind === "textarea") {
+    input = document.createElement("textarea");
+    input.rows = 6; input.spellcheck = false;
+    if (value != null) input.value = value;
+  } else {
+    input = document.createElement("input");
+    input.type = field.kind === "int" || field.kind === "number" ? "number" : "text";
+    if (input.type === "number" && field.minimum != null) input.min = field.minimum;
+    if (value != null) input.value = value;
+    input.autocapitalize = "off"; input.spellcheck = false;
+  }
+  input.dataset.key = field.key;
+  if (field.help) input.title = field.help;
+  if (field.kind === "secret") {
+    input.classList.add("secret");
+    input.readOnly = true; input.autocomplete = "off";
+    input.onfocus = () => input.removeAttribute("readonly");
+  }
+  if (field.key === "model") input.placeholder = "model, e.g. qwen3.8-flash";
+  return input;
+}
+function readControl(input, field) {
+  if (field.kind === "bool") return input.checked;
+  const value = input.value.trim();
+  if (value === "") return null;
+  return field.kind === "int" || field.kind === "number" ? +value : value;
+}
+function globalField(field) {
+  const label = document.createElement("label");
+  if (field.kind === "textarea") label.className = "wide";
+  label.textContent = field.label;
+  label.append(control(field, field.default));
+  if (field.when) label.dataset.when = JSON.stringify(field.when);
+  return label;
+}
+function applyWhen() {
+  for (const label of document.querySelectorAll("#harnessFields label[data-when]")) {
+    const [key, want] = JSON.parse(label.dataset.when);
+    const source = document.querySelector(`#harnessFields [data-key="${key}"]`);
+    label.hidden = !source || source.value !== want;
+  }
+}
+function renderFields() {
+  const box = $("harnessFields");
+  box.replaceChildren();
+  const plain = selected.options.filter(field => !field.advanced);
+  const advanced = selected.options.filter(field => field.advanced);
+  const grid = document.createElement("div");
+  grid.className = "formgrid";
+  plain.forEach(field => grid.append(globalField(field)));
+  box.append(grid);
+  if (advanced.length) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "advanced";
+    const inner = document.createElement("div");
+    inner.className = "formgrid";
+    advanced.forEach(field => inner.append(globalField(field)));
+    details.append(summary, inner);
+    box.append(details);
+  }
+  if (selected.note) {
+    const note = document.createElement("div");
+    note.className = "meta"; note.textContent = selected.note;
+    box.append(note);
+  }
+  applyWhen();
+}
+function runRow(model = "", values = null) {
+  const row = document.createElement("div");
+  row.className = "run-row";
+  row.style.gridTemplateColumns = `repeat(${selected.run.length}, minmax(0, 1fr)) auto`;
+  for (const field of selected.run) {
+    const value = values && field.key in values ? values[field.key]
+      : field.key === "model" ? model : field.default;
+    row.append(control(field, value));
+  }
+  const remove = document.createElement("button");
+  remove.type = "button"; remove.className = "rm"; remove.textContent = "✕";
+  remove.setAttribute("aria-label", "remove this run");
+  remove.onclick = () => { row.remove(); updateEvalPlan(); };
+  row.append(remove);
+  return row;
+}
+function rowValues(row) {
+  const values = {};
+  for (const input of row.querySelectorAll("[data-key]")) {
+    const field = selected.run.find(item => item.key === input.dataset.key);
+    const value = readControl(input, field);
+    if (value != null) values[input.dataset.key] = value;
+  }
+  return values;
+}
+function runRows() {
+  return [...document.querySelectorAll("#runRows .run-row")].map(rowValues);
+}
+function renderHeader() {
+  const head = $("runHeader");
+  head.replaceChildren(...selected.run.map(field => {
+    const span = document.createElement("span");
+    span.textContent = field.label;
+    return span;
+  }));
+  head.style.gridTemplateColumns = `repeat(${selected.run.length}, minmax(0, 1fr)) auto`;
+}
+function rerenderRows() {
+  const values = [...document.querySelectorAll("#runRows .run-row")].map(rowValues);
+  $("runRows").replaceChildren(...(values.length ? values : [{}]).map(v => runRow("", v)));
+  syncRows();
+}
+function selectHarness() {
+  selected = harnesses[$("evalHarness").value];
+  if (!selected) return;
+  renderHeader();
+  renderFields();
+  rerenderRows();
+}
+function syncRows() {
+  if (!selected) return;
+  const rows = runRows();
+  $("runHeader").hidden = !rows.length;
+  const submit = $("evalSubmit");
+  submit.disabled = !rows.some(row => row.model);
+  submit.textContent = rows.length <= 1 ? "launch eval" : `launch ${rows.length} evals`;
+}
+function updateEvalPlan() { syncRows(); }
+function addRun() {
+  const last = $("runRows").lastElementChild;
+  if (last && !last.querySelector('[data-key="model"]').value.trim()) return;
+  const values = last ? rowValues(last) : {};
+  values.model = "";
+  const copy = runRow("", values);
+  $("runRows").append(copy);
+  copy.querySelector('[data-key="model"]').focus();
+  syncRows();
+}
+function openEval() {
+  $("evalOverlay").hidden = false;
+  $("newEvalToggle").setAttribute("aria-expanded", "true");
+  if (!$("runRows").children.length) $("runRows").append(runRow());
+  updateEvalPlan();
+  const first = $("runRows").firstElementChild.querySelector('[data-key="model"]');
+  if (first && !first.value) first.focus();
+}
+function closeEval() {
+  $("evalOverlay").hidden = true;
+  $("newEvalToggle").setAttribute("aria-expanded", "false");
+}
 async function submitEval(event) {
   event.preventDefault();
   const button = $("evalSubmit"), error = $("evalError");
   button.disabled = true; error.textContent = "";
-  const body = {harness: $("evalHarness").value, evals: runRows()};
-  if (body.harness === "codex") {
-    body.prompt = $("evalPrompt").value;
-  } else {
-    Object.assign(body, {api: $("evalApi").value, base_url: $("evalBaseUrl").value,
-      key_env: $("evalKeyEnv").value, api_key: $("evalKey").value || undefined,
-      max_frames: +$("evalFrames").value, max_actions: +$("evalActions").value,
-      max_images: +$("evalImages").value, reasoning_effort: $("evalEffort").value || "low"});
-    for (const [field, key] of [["evalFps", "fps"], ["evalThinking", "thinking_budget"]]) {
-      if ($(field).value) body[key] = +$(field).value;
-    }
+  const body = {harness: selected.key, evals: runRows()};
+  for (const input of document.querySelectorAll("#harnessFields [data-key]")) {
+    if (input.closest("label").hidden) continue;
+    const field = selected.options.find(item => item.key === input.dataset.key);
+    const value = readControl(input, field);
+    if (value != null) body[field.key] = value;
   }
   try {
     await jsonRequest("/api/evals", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    $("evalKey").value = "";
+    for (const input of document.querySelectorAll('#harnessFields [data-key="api_key"]')) input.value = "";
     closeEval();
     await poll();
   } catch (failure) { error.textContent = failure.message; }
   updateEvalPlan();
   return false;
 }
-function runRow(model = "", effort, timeout) {
-  const row = document.createElement("div");
-  row.className = "run-row";
-  row.innerHTML = `<input class="r-model" spellcheck="false" autocapitalize="off"
-      placeholder="model, e.g. muse-spark-1.3-contributor"
-      title="claude/gpt/gemini/mistral… auto-use their official API; append @tag to force one">
-    <input class="r-effort" value="low" autocapitalize="off" title="reasoning effort (Responses) or provider default">
-    <input class="r-timeout" type="number" min="1" value="120" title="wall-clock budget for this run (seconds)">
-    <button type="button" class="rm" aria-label="remove this run">✕</button>`;
-  if (model) row.querySelector(".r-model").value = model;
-  if (effort) row.querySelector(".r-effort").value = effort;
-  if (timeout) row.querySelector(".r-timeout").value = timeout;
-  row.querySelector(".rm").onclick = () => { row.remove(); updateEvalPlan(); };
-  return row;
-}
-function runRows() {
-  return [...document.querySelectorAll("#runRows .run-row")].map(row => {
-    const item = {model: row.querySelector(".r-model").value.trim()};
-    const effort = row.querySelector(".r-effort").value.trim();
-    const timeout = row.querySelector(".r-timeout").value;
-    if ($("evalHarness").value === "tau" && effort) item.reasoning_effort = effort;
-    if (timeout) item.timeout = +timeout;
-    return item;
-  });
-}
-function syncRows() {
-  const rows = runRows();
-  $("runHeader").hidden = !rows.length;
-  const submit = $("evalSubmit");
-  submit.disabled = !rows.some(row => row.model);
-  submit.textContent = rows.length <= 1 ? "launch eval" : `launch ${rows.length} evals`;
-  const busy = evalJobs.filter(job => job.status === "running").length;
-  $("evalCapacity").textContent = busy >= 4 ? "4/4 emulator slots busy — new evals will queue"
-    : busy ? `${busy}/4 emulator slots busy` : "";
-}
-function addRun() {
-  const last = $("runRows").lastElementChild;
-  if (last && !last.querySelector(".r-model").value.trim()) return;
-  const copy = last ? runRow("", last.querySelector(".r-effort").value,
-                             last.querySelector(".r-timeout").value) : runRow();
-  $("runRows").append(copy);
-  copy.querySelector(".r-model").focus();
-  syncRows();
-}
-function updateEvalPlan() { syncRows(); }
-function openEval() {
-  $("evalOverlay").hidden = false;
-  $("newEvalToggle").setAttribute("aria-expanded", "true");
-  if (!$("runRows").children.length) $("runRows").append(runRow("", $("evalEffort").value || "low"));
-  updateEvalPlan();
-  const first = $("runRows").firstElementChild.querySelector(".r-model");
-  if (!first.value) first.focus();
-}
-function closeEval() {
-  $("evalOverlay").hidden = true;
-  $("newEvalToggle").setAttribute("aria-expanded", "false");
+async function loadHarnesses() {
+  try {
+    for (const harness of await jsonRequest("/api/harnesses", {timeout: 10000}))
+      harnesses[harness.key] = harness;
+    const select = $("evalHarness");
+    select.replaceChildren(...Object.values(harnesses).map(harness => {
+      const option = document.createElement("option");
+      option.value = harness.key; option.textContent = harness.label;
+      return option;
+    }));
+    select.value = "tau";
+    selectHarness();
+  } catch (error) { $("pollError").textContent = `Could not load harnesses: ${error.message}`; }
 }
 $("newEvalToggle").onclick = () => $("evalOverlay").hidden ? openEval() : closeEval();
 $("evalClose").onclick = closeEval;
 $("evalOverlay").onclick = event => { if (event.target === $("evalOverlay")) closeEval(); };
 document.addEventListener("keydown", event => { if (event.key === "Escape" && !$("evalOverlay").hidden) closeEval(); });
-$("evalHarness").onchange = () => {
-  const codex = $("evalHarness").value === "codex";
-  $("evalForm").classList.toggle("codex", codex);
-  $("codexFields").hidden = !codex;
-  $("tauFields").hidden = codex;
-  $("advancedFields").hidden = codex;
-  updateEvalPlan();
-};
-$("evalPreset").onchange = () => {
-  const presets = {
-    "opencode-go": ["openai-responses", "https://opencode.ai/zen/go/v1", "OPENCODE_GO_API_KEY"],
-    openai: ["openai-responses", "https://api.openai.com/v1", "OPENAI_API_KEY"],
-    anthropic: ["anthropic", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY"],
-    google: ["google-generative-ai", "https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY"],
-    mistral: ["mistral-conversations", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"],
-  };
-  const preset = presets[$("evalPreset").value];
-  if (!preset) return;
-  [$("evalApi").value, $("evalBaseUrl").value, $("evalKeyEnv").value] = preset;
-  const first = $("runRows").firstElementChild;
-  if (preset === "opencode-go" && first && !$("runRows").querySelector(".r-model").value.trim())
-    first.querySelector(".r-model").value = "muse-spark-1.3-contributor";
-  updateEvalPlan();
-};
-for (const id of ["evalApi", "evalBaseUrl", "evalKeyEnv"]) $(id).oninput = () => { $("evalPreset").value = "custom"; };
+$("evalHarness").onchange = selectHarness;
+$("harnessFields").addEventListener("input", applyWhen);
+$("harnessFields").addEventListener("change", applyWhen);
 $("runRows").addEventListener("input", updateEvalPlan);
 $("addRun").onclick = addRun;
+loadHarnesses();
 poll();
 setInterval(poll, 2000);
 </script></body></html>

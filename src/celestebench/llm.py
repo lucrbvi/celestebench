@@ -58,7 +58,8 @@ class TauPolicy:
         self.provider, self.model = provider, model
         self.max_frames, self.max_actions = max_frames, max_actions
         self.max_images = max_images
-        self.trace, self.system = trace, system or system_prompt(
+        self.trace = trace
+        self.system = system if system is not None else system_prompt(
             fps=fps, max_frames=max_frames, max_images=max_images)
         self._step = 0
         self._feedback: str | None = None
@@ -93,7 +94,7 @@ class TauPolicy:
             execute_fn=_select_action,
         )
         self.harness = AgentHarness(AgentHarnessConfig(
-            provider=provider, model=model, system=system,
+            provider=provider, model=model, system=self.system,
             tools=[self.tool], max_turns=1,
         ))
 

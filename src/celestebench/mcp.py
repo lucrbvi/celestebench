@@ -246,6 +246,14 @@ def _parser():
     return parser
 
 
+async def _exit_with_parent():
+    """An abandoned server must not keep the port: exit once reparented."""
+    parent = os.getppid()
+    while parent != 1 and os.getppid() == parent:
+        await asyncio.sleep(1)
+    os._exit(1)
+
+
 async def _main(args):
     if (not math.isfinite(args.timeout) or args.timeout <= 0
             or args.frames is not None and args.frames < 1):
@@ -258,6 +266,7 @@ async def _main(args):
                       fps=None if args.lite else args.fps,
                       max_frames=args.max_frames, max_images=args.max_images)
     app = server(episode)
+    watchdog = asyncio.create_task(_exit_with_parent())
     try:
         if args.transport == "stdio":
             await app.run_stdio_async()

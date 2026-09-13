@@ -9,11 +9,18 @@ import numpy as np
 try:
     from PIL import Image
     from tau_agent import (
-        AssistantMessage, ImageContent, TextContent, ThinkingContent, ToolCall,
+        AssistantMessage,
+        ImageContent,
+        TextContent,
+        ThinkingContent,
+        ToolCall,
     )
     from tau_agent.provider_events import (
-        AssistantDoneEvent, AssistantErrorEvent, ThinkingDeltaEvent,
+        AssistantDoneEvent,
+        AssistantErrorEvent,
+        ThinkingDeltaEvent,
     )
+
     from celestebench.llm import TauPolicy
 except ImportError:
     TauPolicy = None
@@ -69,6 +76,25 @@ class TauPolicyTests(unittest.IsolatedAsyncioTestCase):
         if frames is None:
             frames = [np.zeros((3, 4, 3), dtype="uint8")]
         return await TauPolicy(provider, "fake-model", **kwargs)(frames)
+
+    async def test_system_prompt_reaches_provider_on_every_turn(self):
+        from celestebench.prompt import system_prompt
+
+        for fps, system in [(30, None), (None, None), (30, "Custom instructions"), (30, "")]:
+            with self.subTest(fps=fps, system=system):
+                provider = self.FakeProvider([
+                    AssistantDoneEvent(reason="toolUse", message=self.assistant(self.call({
+                        "actions": [{"buttons": 0, "frames": 1}],
+                    })))
+                ])
+                policy = TauPolicy(provider, "fake-model", fps=fps, system=system,
+                                   max_frames=120, max_images=2)
+                expected = system if system is not None else system_prompt(
+                    fps=fps, max_frames=120, max_images=2)
+                for _ in range(2):
+                    await policy([np.zeros((3, 4, 3), dtype="uint8")])
+                self.assertEqual(policy.system, expected)
+                self.assertEqual([call["system"] for call in provider.calls], [expected, expected])
 
     async def test_valid_actions_and_single_png_request(self):
         provider = self.FakeProvider([

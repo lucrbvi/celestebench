@@ -1,6 +1,7 @@
 """Run Codex in a small Lima VM while Celeste stays on the host."""
 
 import argparse
+import fcntl
 import json
 import os
 import platform
@@ -18,8 +19,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from celestebench import BENCHMARK_VERSION
+from celestebench.prompt import system_prompt
+
 CONFIG = Path(__file__).with_name("codex-vm.yaml")
 NAME, PORT = "celestebench-codex", 8124
+# Mirrors codex-vm.yaml: slot index i is bench{i+1}, uid 2001+i, port PORT+i.
+POOL, SLOTS = 8, 4
 
 
 def _find_limactl() -> Path:
@@ -59,7 +65,7 @@ def ssh(name, *remote):
     return args + ([shlex.join(remote)] if remote else [])
 
 
-def tunnel_command(name):
+def tunnel_command(name, port):
     # Lima's ssh config shares one ControlMaster; multiplexing on it exits this
     # command immediately and strands the forward. Own the connection instead.
     return [
@@ -76,7 +82,7 @@ def tunnel_command(name):
         "ExitOnForwardFailure=yes",
         "-N",
         "-R",
-        f"127.0.0.1:{PORT}:127.0.0.1:{PORT}",
+        f"127.0.0.1:{port}:127.0.0.1:{port}",
         f"lima-{name}",
     ]
 
@@ -120,34 +126,42 @@ def setup(name):
         check=True,
         stdout=subprocess.DEVNULL,
     )
+    pool = f"for n in {{1..{POOL}}}; do id bench$n >/dev/null || exit 1; done"
+    if subprocess.run(ssh(name, "bash", "-c", pool), check=False,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        raise RuntimeError("this VM has no per-run Codex users; recreate it with "
+                           "examples/codex_vm.py stop && examples/codex_vm.py start")
     subprocess.run(
-        ssh(name, "sudo", "runuser", "-u", "bench", "--", "codex", "--version"),
+        ssh(name, "sudo", "runuser", "-u", "bench1", "--", "codex", "--version"),
         check=True,
     )
 
 
-def login(name):
-    start(name)
-    setup(name)
-    subprocess.run(
-        ssh(
-            name,
-            "sudo",
-            "runuser",
-            "-u",
-            "bench",
-            "--",
-            "bash",
-            "-lc",
-            "cd /home/bench && exec codex login --device-auth",
-        ),
-        check=True,
-    )
+def claim_slot():
+    """Reserve one bench user for this run. Each run needs its own uid, so it
+    cannot share a slot, and the file lock dies with this process if we crash."""
+    for index in range(SLOTS):
+        slot = (Path(tempfile.gettempdir())
+                / f"celestebench-codex-slot-{index}.lock").open("w")
+        try:
+            fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            slot.close()
+            continue
+        return index, slot
+    raise RuntimeError(f"all {SLOTS} Codex slots are busy")
 
 
-def wait_for_mcp(process, token, timeout=20):
+def vm_lock():
+    """Serialize VM boot and setup so parallel runs cannot race limactl start."""
+    lock = (Path(tempfile.gettempdir()) / "celestebench-codex-vm.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def wait_for_mcp(process, token, port, timeout=20):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/mcp",
+        f"http://127.0.0.1:{port}/mcp",
         data=b"{}",
         method="POST",
         headers={
@@ -180,12 +194,16 @@ def stop_process(process):
         process.wait()
 
 
-def _stop_mcp(process, rollout, grace=75):
-    """Give a still-running episode its deadline and let the recorder finish:
-    a SIGTERM mid-finalization writes an mp4 without its moov index."""
+def _stop_mcp(process, rollout, timeout=0, grace=60):
+    """Let a still-running episode reach its own deadline and finish recording: a
+    SIGTERM mid-finalization writes an mp4 without its moov index. The MCP server
+    owns the wall-clock budget, so the game keeps running until it times out even
+    after the model ends its turn."""
     if process is not None and process.poll() is None:
         done = rollout / "live.done"
-        deadline = time.monotonic() + grace
+        # A run that never called a tool has no episode to let finish.
+        wait = timeout + grace if (rollout / "config.json").is_file() else 0
+        deadline = time.monotonic() + wait
         while time.monotonic() < deadline and process.poll() is None and not done.is_file():
             time.sleep(0.25)
         if done.is_file():
@@ -198,7 +216,7 @@ def limit_output():
 
 
 GUEST_RUNNER = r"""import json, os, pwd, resource, signal, subprocess, sys
-d=json.load(sys.stdin); u=pwd.getpwnam("bench")
+d=json.load(sys.stdin); u=pwd.getpwnam(d["user"])
 env={"HOME":u.pw_dir,"PATH":"/usr/local/bin:/usr/bin:/bin","CELESTEBENCH_MCP_TOKEN":d["token"]}
 if d.get("api_key"): env["CODEX_API_KEY"]=d["api_key"]
 def demote():
@@ -215,111 +233,180 @@ except subprocess.TimeoutExpired:
 raise SystemExit(p.returncode)"""
 
 
-def run(name, prompt, model, output, timeout, lite, frames=None, max_frames=30):
-    api_key, token = os.environ.get("CODEX_API_KEY") or None, secrets.token_urlsafe(32)
-    if api_key and "\n" in api_key:
-        raise SystemExit("CODEX_API_KEY must not contain a newline")
-    start(name)
-    setup(name)
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", PORT))
-    output.mkdir(parents=True, exist_ok=False)
-    rollout = output / "rollout"
-    config = {
-        "vm": name,
-        "model": model,
-        "timeout": timeout,
-        "frames": frames,
-        "max_frames": max_frames,
-        "lite": lite,
-    }
-    (output / "config.json").write_text(
-        json.dumps(config, indent=2) + "\n", encoding="utf-8"
+# Codex reasoning efforts, weakest to strongest. Tau's "off" and "minimal" have
+# no direct equivalent: models like gpt-6-astra reject them, so clamp per model.
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def codex_efforts(name, model, user):
+    """The reasoning efforts Codex accepts for one model, from its own catalog."""
+    if not model:
+        return ()
+    result = subprocess.run(
+        ssh(name, "sudo", "runuser", "-u", user, "--", "codex", "debug", "models"),
+        check=False, capture_output=True, text=True,
     )
-    (output / "prompt.txt").write_text(prompt, encoding="utf-8")
-    mcp_args = [
-        sys.executable,
-        "-m",
-        "celestebench.mcp",
-        "--transport",
-        "http",
-        "--output",
-        str(rollout),
-        "--port",
-        str(PORT),
-        "--timeout",
-        str(timeout),
-        "--max-frames",
-        str(max_frames),
-    ]
-    if frames is not None:
-        mcp_args += ["--frames", str(frames)]
-    if lite:
-        mcp_args.append("--lite")
-    env = os.environ.copy()
-    env.pop("CODEX_API_KEY", None)
-    env["CELESTEBENCH_MCP_TOKEN"] = token
-    mcp = subprocess.Popen(mcp_args, env=env, start_new_session=True)
-    tunnel = None
     try:
-        wait_for_mcp(mcp, token)
-        tunnel = subprocess.Popen(tunnel_command(name), start_new_session=True)
-        time.sleep(0.3)
-        if tunnel.poll() is not None:
-            raise RuntimeError("SSH reverse tunnel exited early")
-        codex = [
-            "codex",
-            "exec",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--json",
-            "--sandbox",
-            "read-only",
-            "-c",
-            "mcp_servers.celeste.url='http://127.0.0.1:8124/mcp'",
-            "-c",
-            "mcp_servers.celeste.bearer_token_env_var='CELESTEBENCH_MCP_TOKEN'",
-            "-c",
-            f"mcp_servers.celeste.tool_timeout_sec={timeout + 30}",
-            "-c",
-            "mcp_servers.celeste.required=true",
-            "-c",
-            "mcp_servers.celeste.default_tools_approval_mode='approve'",
-            "-",
-        ]
-        if model:
-            codex[2:2] = ["--model", model]
-        payload = json.dumps(
-            {
-                "api_key": api_key,
-                "token": token,
-                "prompt": prompt,
-                "args": codex,
-                "timeout": timeout + 30,
-            }
+        models = json.loads(result.stdout).get("models", [])
+    except ValueError:
+        return ()
+    for entry in models:
+        if entry.get("slug") == model:
+            return tuple(level["effort"]
+                         for level in entry.get("supported_reasoning_levels", ()))
+    return ()
+
+
+def reasoning_effort(level, supported=()):
+    """Tau's thinking level as the closest effort the model actually accepts."""
+    if not level:
+        return None
+    wanted = "none" if level == "off" else level
+    if wanted not in EFFORTS or not supported or wanted in supported:
+        return wanted
+    at = EFFORTS.index(wanted)
+    stronger = [effort for effort in EFFORTS[at + 1:] if effort in supported]
+    weaker = [effort for effort in reversed(EFFORTS[:at]) if effort in supported]
+    return (stronger or weaker)[0]
+
+
+def run(name, prompt, model, output, timeout, fps, frames=None, max_frames=30,
+        thinking_level=None):
+    api_key, token = os.environ.get("CODEX_API_KEY") or None, secrets.token_urlsafe(32)
+    if not api_key:
+        raise SystemExit("Set CODEX_API_KEY: parallel Codex runs each get their own "
+                         "VM user, so a shared device login cannot be reused")
+    if "\n" in api_key:
+        raise SystemExit("CODEX_API_KEY must not contain a newline")
+    index, slot = claim_slot()
+    port, user = PORT + index, f"bench{index + 1}"
+    try:
+        boot = vm_lock()
+        try:
+            start(name)
+            setup(name)
+        finally:
+            boot.close()
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", port))
+        output.mkdir(parents=True, exist_ok=False)
+        rollout = output / "rollout"
+        config = {
+            "vm": name,
+            "user": user,
+            "model": model,
+            "benchmark_version": BENCHMARK_VERSION,
+            "timeout": timeout,
+            "frames": frames,
+            "max_frames": max_frames,
+            "fps": fps,
+            "thinking_level": thinking_level,
+        }
+        (output / "config.json").write_text(
+            json.dumps(config, indent=2) + "\n", encoding="utf-8"
         )
-        with (output / "codex.jsonl").open("xb") as trace:
-            subprocess.run(
-                ssh(name, "sudo", "python3", "-c", GUEST_RUNNER),
-                input=payload,
-                text=True,
-                stdout=trace,
-                check=True,
-                timeout=timeout + 45,
-                preexec_fn=limit_output,
+        (output / "prompt.txt").write_text(prompt, encoding="utf-8")
+        mcp_args = [
+            sys.executable,
+            "-m",
+            "celestebench.mcp",
+            "--transport",
+            "http",
+            "--output",
+            str(rollout),
+            "--port",
+            str(port),
+            "--timeout",
+            str(timeout),
+            "--max-frames",
+            str(max_frames),
+        ]
+        if frames is not None:
+            mcp_args += ["--frames", str(frames)]
+        if fps is None:
+            mcp_args.append("--lite")  # empty frame rate pauses the game
+        else:
+            mcp_args += ["--fps", str(fps)]
+        env = os.environ.copy()
+        env.pop("CODEX_API_KEY", None)
+        env["CELESTEBENCH_MCP_TOKEN"] = token
+        mcp = subprocess.Popen(mcp_args, env=env, start_new_session=True)
+        tunnel = None
+        try:
+            wait_for_mcp(mcp, token, port)
+            tunnel = subprocess.Popen(tunnel_command(name, port), start_new_session=True)
+            time.sleep(0.3)
+            if tunnel.poll() is not None:
+                raise RuntimeError("SSH reverse tunnel exited early")
+            # Codex never forwards the MCP server's `instructions` to the model, so
+            # the game rules must be injected as developer instructions instead.
+            instructions = system_prompt(fps=fps, max_frames=max_frames, mcp=True, oneshot=True)
+            codex = [
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "-c",
+                f"mcp_servers.celeste.url='http://127.0.0.1:{port}/mcp'",
+                "-c",
+                "mcp_servers.celeste.bearer_token_env_var='CELESTEBENCH_MCP_TOKEN'",
+                "-c",
+                f"mcp_servers.celeste.tool_timeout_sec={timeout + 30}",
+                "-c",
+                "mcp_servers.celeste.required=true",
+                "-c",
+                "mcp_servers.celeste.default_tools_approval_mode='approve'",
+                "-c",
+                f"developer_instructions='''{instructions}'''",
+                "-c",
+                "features.apps=false",
+                "-c",
+                "features.plugins=false",
+                "-",
+            ]
+            if model:
+                codex[2:2] = ["--model", model]
+            supported = codex_efforts(name, model, user) if thinking_level else ()
+            effort = reasoning_effort(thinking_level, supported)
+            if effort:
+                codex[-1:-1] = ["-c", f"model_reasoning_effort={effort}"]
+            payload = json.dumps(
+                {
+                    "api_key": api_key,
+                    "token": token,
+                    "user": user,
+                    "prompt": prompt,
+                    "args": codex,
+                    "timeout": timeout + 30,
+                }
             )
+            with (output / "codex.jsonl").open("xb") as trace:
+                subprocess.run(
+                    ssh(name, "sudo", "python3", "-c", GUEST_RUNNER),
+                    input=payload,
+                    text=True,
+                    stdout=trace,
+                    check=True,
+                    timeout=timeout + 45,
+                    preexec_fn=limit_output,
+                )
+        finally:
+            stop_process(tunnel)
+            _stop_mcp(mcp, output / "rollout", timeout)
     finally:
-        stop_process(tunnel)
-        _stop_mcp(mcp, output / "rollout")
+        slot.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", default=NAME)
     sub = parser.add_subparsers(dest="action", required=True)
-    for action in ("start", "setup", "login", "stop"):
+    for action in ("start", "setup", "stop"):
         sub.add_parser(action)
     run_parser = sub.add_parser("run")
     prompts = run_parser.add_mutually_exclusive_group(required=True)
@@ -330,7 +417,8 @@ def main():
     run_parser.add_argument("--timeout", type=int, default=300)
     run_parser.add_argument("--frames", type=int)
     run_parser.add_argument("--max-frames", type=int, default=30)
-    run_parser.add_argument("--lite", action="store_true")
+    run_parser.add_argument("--thinking-level")
+    run_parser.add_argument("--fps", type=float)
     args = parser.parse_args()
     if not all(c.isalnum() or c in "_-" for c in args.name):
         parser.error("invalid VM name")
@@ -338,8 +426,6 @@ def main():
         start(args.name)
     elif args.action == "setup":
         setup(args.name)
-    elif args.action == "login":
-        login(args.name)
     elif args.action == "stop":
         command(["stop", args.name])
     else:
@@ -348,8 +434,10 @@ def main():
             or args.frames is not None
             and args.frames <= 0
             or args.max_frames <= 0
+            or args.fps is not None
+            and args.fps <= 0
         ):
-            parser.error("timeout, frames, and max-frames must be positive")
+            parser.error("timeout, frames, max-frames, and fps must be positive")
         prompt = (
             args.prompt if args.prompt is not None else args.prompt_file.read_text()
         )
@@ -359,9 +447,10 @@ def main():
             args.model,
             args.output,
             args.timeout,
-            args.lite,
+            args.fps,
             args.frames,
             args.max_frames,
+            args.thinking_level,
         )
 
 

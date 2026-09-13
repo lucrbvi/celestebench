@@ -25,6 +25,32 @@ class CodexVMTest(unittest.TestCase):
     def test_limactl_resolution(self):
         self.assertIn("limactl", str(codex_vm.LIMACTL))
 
+    def test_slots_hand_out_distinct_users_then_refuse(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(codex_vm.tempfile, "gettempdir", return_value=tmp):
+            taken = [codex_vm.claim_slot() for _ in range(codex_vm.SLOTS)]
+            try:
+                self.assertEqual([index for index, _ in taken],
+                                 list(range(codex_vm.SLOTS)))
+                self.assertEqual({codex_vm.PORT + index for index, _ in taken},
+                                 set(range(codex_vm.PORT, codex_vm.PORT + codex_vm.SLOTS)))
+                with self.assertRaisesRegex(RuntimeError, "slots are busy"):
+                    codex_vm.claim_slot()
+            finally:
+                for _, lock in taken:
+                    lock.close()
+
+    def test_reasoning_effort_maps_tau_thinking_levels(self):
+        self.assertIsNone(codex_vm.reasoning_effort(None))
+        self.assertIsNone(codex_vm.reasoning_effort(""))
+        self.assertEqual(codex_vm.reasoning_effort("off"), "none")
+        self.assertEqual(codex_vm.reasoning_effort("high"), "high")
+        # Clamp to what the model accepts: gpt-6-astra has no none/minimal.
+        self.assertEqual(codex_vm.reasoning_effort("off", ("low", "medium")), "low")
+        self.assertEqual(codex_vm.reasoning_effort("minimal", ("low", "max")), "low")
+        self.assertEqual(codex_vm.reasoning_effort("max", ("low", "high")), "high")
+        self.assertEqual(codex_vm.reasoning_effort("medium", ("low", "high")), "high")
+
     @patch.object(codex_vm, "command")
     def test_setup_refuses_an_instance_with_host_mounts(self, command):
         command.return_value.stdout = '[{"location":"/Users/luc"}]\n'
@@ -38,9 +64,10 @@ class CodexVMTest(unittest.TestCase):
         command = codex_vm.ssh("vm", "printf", "%s", "$(touch /tmp/nope); ' quoted")
         self.assertEqual(command[-2], "lima-vm")
         self.assertEqual(command[-1], "printf %s '$(touch /tmp/nope); '\"'\"' quoted'")
-        tunnel = codex_vm.tunnel_command("vm")
+        tunnel = codex_vm.tunnel_command("vm", 8124)
         self.assertLess(tunnel.index("-N"), tunnel.index("lima-vm"))
         self.assertLess(tunnel.index("-R"), tunnel.index("lima-vm"))
+        self.assertIn("127.0.0.1:8124:127.0.0.1:8124", tunnel)
         # Lima's shared ControlMaster strands the forward and exits the command.
         self.assertIn("ControlMaster=no", tunnel)
         self.assertIn("ControlPath=none", tunnel)
@@ -67,7 +94,7 @@ class CodexVMTest(unittest.TestCase):
             patch.dict(codex_vm.os.environ, {"CODEX_API_KEY": "api-secret"}),
         ):
             output = Path(root) / "result"
-            codex_vm.run("vm", hostile, None, output, 12, True, 90, 7)
+            codex_vm.run("vm", hostile, None, output, 12, 30, 90, 7, "high")
             payload = json.loads(run.call_args.kwargs["input"])
             argv = run.call_args.args[0]
             self.assertEqual(payload["prompt"], hostile)
@@ -77,13 +104,18 @@ class CodexVMTest(unittest.TestCase):
             self.assertNotIn("api-secret", " ".join(argv))
             self.assertNotIn(hostile, " ".join(argv))
             self.assertNotIn("--model", payload["args"])
+            self.assertIn("model_reasoning_effort=high", payload["args"])
             self.assertIn("--frames", popen.call_args_list[0].args[0])
             self.assertIn("--max-frames", popen.call_args_list[0].args[0])
+            self.assertIn("--fps", popen.call_args_list[0].args[0])
             self.assertEqual((output / "prompt.txt").read_text(), hostile)
             self.assertNotIn("secret", (output / "config.json").read_text())
         start.assert_called_once_with("vm")
         setup.assert_called_once_with("vm")
-        ready.assert_called_once_with(processes[0], "generated-token")
+        self.assertEqual(ready.call_args.args[0], processes[0])
+        self.assertEqual(ready.call_args.args[1], "generated-token")
+        self.assertIn(ready.call_args.args[2],
+                      range(codex_vm.PORT, codex_vm.PORT + codex_vm.SLOTS))
         self.assertEqual(
             [call.args[0] for call in stop.call_args_list], processes[::-1]
         )
@@ -102,9 +134,10 @@ class CodexVMTest(unittest.TestCase):
         popen.return_value = process
         with (
             tempfile.TemporaryDirectory() as root,
+            patch.dict(codex_vm.os.environ, {"CODEX_API_KEY": "api-secret"}),
             self.assertRaisesRegex(RuntimeError, "collision"),
         ):
-            codex_vm.run("vm", "prompt", None, Path(root) / "out", 2, False)
+            codex_vm.run("vm", "prompt", None, Path(root) / "out", 2, None)
         stop.assert_any_call(None)
         stop.assert_any_call(process)
 
@@ -114,21 +147,28 @@ class CodexVMTest(unittest.TestCase):
         process.poll.return_value = None
         with tempfile.TemporaryDirectory() as root:
             rollout = Path(root) / "rollout"
+            rollout.mkdir(parents=True)
+            (rollout / "config.json").write_text("{}")  # the engine started
             # Missing live.done: the episode still runs, so it gets its grace
             # window instead of dying before the mp4 index is written.
             with patch.object(codex_vm.time, "monotonic",
                               side_effect=[0] + list(i * 0.25 for i in range(1, 10000))), \
-                    patch.object(codex_vm.time, "sleep"):
-                codex_vm._stop_mcp(process, rollout, grace=1)
-        stop.assert_called_once_with(process)
-        # live.done present: short wait, then stop.
-        rollout.mkdir(parents=True)
-        (rollout / "live.done").write_text("")
-        with patch.object(codex_vm.time, "monotonic", return_value=0), \
-                patch.object(codex_vm.time, "sleep") as sleep:
-            codex_vm._stop_mcp(process, rollout)
-        sleep.assert_any_call(1)
-        stop.assert_called_with(process)
+                    patch.object(codex_vm.time, "sleep") as sleep:
+                codex_vm._stop_mcp(process, rollout, timeout=1, grace=0)
+            sleep.assert_any_call(0.25)
+            stop.assert_called_once_with(process)
+            # live.done present: short wait, then stop.
+            (rollout / "live.done").write_text("")
+            with patch.object(codex_vm.time, "monotonic", return_value=0), \
+                    patch.object(codex_vm.time, "sleep") as sleep:
+                codex_vm._stop_mcp(process, rollout)
+            sleep.assert_any_call(1)
+            stop.assert_called_with(process)
+        # No engine ever started: skip the whole wait.
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(codex_vm.time, "sleep") as sleep:
+                codex_vm._stop_mcp(process, Path(root) / "rollout", timeout=300)
+            sleep.assert_not_called()
 
     def test_guest_runner_drops_privileges_times_out_and_limits_output(self):
         self.assertIn("os.setuid", codex_vm.GUEST_RUNNER)

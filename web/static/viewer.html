@@ -1,7 +1,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
 <body>
-<header><h1><a href="/">celestebench</a></h1><select id="run" aria-label="run"></select><span id="meta" class="meta"></span><button id="deleteRun" class="danger" type="button" disabled>delete run</button><span id="pollError" role="status"></span><nav><a href="/" aria-current="page">runs</a><a href="/evals">evaluations</a></nav></header>
+<header><h1><a href="/">celestebench</a></h1><select id="run" aria-label="run"></select><span id="meta" class="meta"></span><button id="deleteRun" class="danger" type="button" disabled>delete run</button><span id="pollError" role="status"></span><nav><a href="/runs" aria-current="page">runs</a><a href="/evals">evaluations</a><a href="/leaderboard">leaderboard</a></nav></header>
 <main>
 <aside id="list"></aside>
 <section>
@@ -9,6 +9,7 @@
   <img id="liveFrame" alt="live frame" style="display:none;width:512px;height:512px;image-rendering:pixelated;background:#000">
   <div id="timeline"><div id="playhead"></div></div>
   <div id="clock">0.0 / 0.0 s</div>
+  <a id="download" class="button" download hidden>download</a>
 </section>
 <section id="panel"></section>
 </main>
@@ -57,7 +58,7 @@ function show(d) {
     ${d.screenshot && /^(data:image\/(png|jpeg|webp);base64,|\/screenshot\/)/.test(d.screenshot) ? `<img src="${esc(d.screenshot)}" title="what the model saw">` : ""}
     <p class="meta">played: ${acts}</p></div>`;
   if (d.thinking) html += `<div class="card"><h3>CoT</h3><div class="thinking">${esc(d.thinking)}</div></div>`;
-  if (d.error) html += `<div class="card"><h3>${esc(status(d))}</h3><pre>${esc(d.error)}</pre></div>`;
+  if (d.error) html += `<div class="card"><pre>${esc(d.error)}</pre></div>`;
   if (d.text) html += `<div class="card"><h3>reply</h3><div class="reply">${esc(d.text)}</div></div>`;
   if (d.tool) html += `<div class="card"><h3>tool call</h3><pre>${esc(JSON.stringify(d.tool))}</pre></div>`;
   p.innerHTML = html;
@@ -104,14 +105,16 @@ function buildList() {
   }
 }
 
-async function jsonRequest(url, options) {
-  const response = await fetch(url, options);
+async function jsonRequest(url, options = {}) {
+  const signal = options.timeout ? AbortSignal.timeout(options.timeout) : undefined;
+  const response = await fetch(url, {...options, signal});
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw Error(data.error || `Request failed (${response.status})`);
   return data;
 }
 function attachVideo(run) {
   const liveFrame = $("liveFrame");
+  const download = $("download");
   if (run.status === "running") {
     video.style.display = "none";
     if (video.hasAttribute("src")) { video.removeAttribute("src"); video.load(); }
@@ -119,6 +122,8 @@ function attachVideo(run) {
     const source = "/live/" + encodeURIComponent(run.name);
     if (liveFrame.getAttribute("src") !== source) liveFrame.src = source;
     liveFrame.style.display = "block";
+    download.hidden = true;
+    download.removeAttribute("href");
   } else if (run.video) {
     if (video.getAttribute("src") !== run.video) {
       video.src = run.video;
@@ -128,12 +133,17 @@ function attachVideo(run) {
     liveFrame.style.display = "none";
     liveFrame.removeAttribute("src");
     delete liveFrame.dataset.live;
+    download.href = "/export/" + encodeURIComponent(run.name);
+    download.download = run.name.replaceAll("/", "_") + ".mp4";
+    download.hidden = false;
   } else {
     video.style.display = "none";
     if (video.hasAttribute("src")) { video.removeAttribute("src"); video.load(); }
     liveFrame.style.display = "none";
     liveFrame.removeAttribute("src");
     delete liveFrame.dataset.live;
+    download.hidden = true;
+    download.removeAttribute("href");
   }
 }
 async function loadRun(name) {
@@ -150,7 +160,7 @@ async function loadRun(name) {
   $("liveFrame").removeAttribute("src");
   $("liveFrame").style.display = "none";
   $("clock").textContent = "waiting for observation";
-  $("meta").textContent = run.model;
+  $("meta").textContent = run.model + (run.progress == null ? "" : ` · ${Number(run.progress).toFixed(2)}% (${run.score_timing || "unscored"})`);
   attachVideo(run);
   buildList(); buildTimeline(1); show(null);
   const data = await jsonRequest("/api/run/" + encodeURIComponent(name));
@@ -185,7 +195,7 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    runs = await jsonRequest("/api/runs");
+    runs = await jsonRequest("/api/runs", {timeout: 10000});
     renderRuns();
     const run = runs.find(r => r.name === selectedRun);
     if (run && (run.status === "running" || loadedStatus === "running" || (run.video && !video.getAttribute("src")))) {
@@ -197,7 +207,7 @@ async function poll() {
 }
 async function refreshSelectedRun(run) {
   const id = request;
-  const data = await jsonRequest("/api/run/" + encodeURIComponent(run.name));
+  const data = await jsonRequest("/api/run/" + encodeURIComponent(run.name), {timeout: 10000});
   if (id !== request || run.name !== selectedRun) return;
   const oldShown = shown?.decision;
   const wasLive = !video.getAttribute("src");
@@ -214,14 +224,17 @@ async function init() {
   await poll();
   $("run").onchange = () => {
     const name = $("run").value;
-    history.pushState(null, "", "/?run=" + encodeURIComponent(name));
+    history.pushState(null, "", "/runs?run=" + encodeURIComponent(name));
     loadRun(name).catch(reportError);
   };
   const requested = new URLSearchParams(location.search).get("run");
-  const initial = runs.find(r => r.name === requested)?.name || runs[0]?.name;
+  const initial = requested == null ? runs[0]?.name : runs.find(r => r.name === requested)?.name;
   if (initial) {
-    if (initial !== requested) history.replaceState(null, "", "/?run=" + encodeURIComponent(initial));
+    if (initial !== requested) history.replaceState(null, "", "/runs?run=" + encodeURIComponent(initial));
     await loadRun(initial);
+  } else if (requested != null) {
+    history.replaceState(null, "", "/runs");
+    $("meta").textContent = `run not found: ${requested}`;
   }
   setInterval(poll, 2000);
 }
@@ -237,10 +250,10 @@ $("deleteRun").onclick = async () => {
     renderRuns();
     const next = runs[Math.min(index, runs.length - 1)];
     if (next) {
-      history.replaceState(null, "", "/?run=" + encodeURIComponent(next.name));
+      history.replaceState(null, "", "/runs?run=" + encodeURIComponent(next.name));
       await loadRun(next.name);
     } else {
-      history.replaceState(null, "", "/");
+      history.replaceState(null, "", "/runs");
       video.pause(); video.removeAttribute("src"); video.load();
       $("run").innerHTML = ""; $("meta").textContent = ""; $("list").innerHTML = "";
       $("panel").innerHTML = ""; $("timeline").querySelectorAll(".bar").forEach(bar => bar.remove());

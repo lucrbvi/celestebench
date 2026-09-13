@@ -13,6 +13,18 @@ _ROOT = Path(__file__).resolve().parents[2]
 UPSCALE = 4
 
 
+class _GameState(C.Structure):
+    _fields_ = [
+        ("room", C.c_int32),
+        ("alive", C.c_int32),
+        ("feet_y", C.c_float),
+        ("grounded", C.c_int32),
+        ("spawn_feet_y", C.c_float),
+        ("exit_feet_y", C.c_float),
+        ("deaths", C.c_int32),
+    ]
+
+
 class Button(IntFlag):
     LEFT = 1
     RIGHT = 2
@@ -38,6 +50,7 @@ class Open8:
             ("step", [C.c_uint32, C.c_uint8], C.c_int),
             ("frame_ms", [], C.c_uint32),
             ("framebuffer", [C.POINTER(C.c_uint8)], None),
+            ("game_state", [], C.POINTER(_GameState)),
         ):
             fn = getattr(self._lib, f"shim_{name}")
             fn.argtypes, fn.restype = args, result
@@ -67,6 +80,24 @@ class Open8:
         frame = np.empty((128, 128, 4), dtype=np.uint8)
         self._lib.shim_framebuffer(frame.ctypes.data_as(C.POINTER(C.c_uint8)))
         return frame
+
+    @property
+    def game_state(self) -> dict | None:
+        if self._lib is None:
+            raise RuntimeError("environment is closed")
+        state = self._lib.shim_game_state()
+        if not state:
+            return None
+        state = state.contents
+        return {
+            "room": state.room,
+            "alive": bool(state.alive),
+            "feet_y": None if np.isnan(state.feet_y) else float(state.feet_y),
+            "grounded": bool(state.grounded),
+            "spawn_feet_y": None if np.isnan(state.spawn_feet_y) else float(state.spawn_feet_y),
+            "exit_feet_y": None if np.isnan(state.exit_feet_y) else float(state.exit_feet_y),
+            "deaths": state.deaths,
+        }
 
     def step(self, buttons: int = 0, frames: int = 1) -> np.ndarray:
         """Hold a button mask for N frames; return the final RGBA image."""

@@ -26,19 +26,25 @@ provision:
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates nftables nodejs npm
-    id bench >/dev/null 2>&1 || useradd --create-home --shell /bin/bash bench
+    # One unprivileged user per concurrent Codex run. The uid numbers are part of
+    # the nftables policy below; keep them in sync with POOL in codex_vm.py
+    # (slot index i = bench{i+1}, uid 2001+i, port 8124+i).
+    for n in 1 2 3 4 5 6 7 8; do
+      id "bench$n" >/dev/null 2>&1 || useradd --create-home --uid "$((2000 + n))" --shell /bin/bash "bench$n"
+    done
     npm install --global @openai/codex@0.153.4
 
-    bench_uid=$(id -u bench)
     {
       echo '#!/usr/sbin/nft -f'
       echo 'table inet celestebench {'
       echo '  chain output {'
       echo '    type filter hook output priority 0; policy accept;'
-      echo "    meta skuid $bench_uid jump bench_output"
+      for n in 1 2 3 4 5 6 7 8; do
+        echo "    meta skuid $((2000 + n)) jump bench_output"
+      done
       echo '  }'
       echo '  chain bench_output {'
-      echo '    oifname "lo" tcp dport 8124 accept'
+      echo '    oifname "lo" tcp dport 8124-8131 accept'
       echo '    oifname "lo" meta l4proto { tcp, udp } th dport 53 accept'
       echo '    oifname "lo" reject'
       awk '/^nameserver / {print $2}' /etc/resolv.conf | while read -r resolver; do
@@ -58,8 +64,8 @@ provision:
     nft -f /etc/nftables.celestebench
     cp /etc/nftables.celestebench /etc/nftables.conf
     systemctl enable --now nftables
-    test "$(id -Gn bench)" = bench
-    test "$(runuser -u bench -- codex --version)" = 'codex-cli 0.153.4'
+    test "$(id -Gn bench1)" = bench1
+    test "$(runuser -u bench1 -- codex --version)" = 'codex-cli 0.153.4'
     apt-get clean
     npm cache clean --force
     rm -rf /var/lib/apt/lists/*

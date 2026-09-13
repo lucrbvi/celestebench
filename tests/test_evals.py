@@ -80,7 +80,7 @@ class EvalTests(unittest.TestCase):
             self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
             time.sleep(0.1)
 
-    def test_model_api_override_routes_a_single_job_to_its_own_api(self):
+    def test_provider_tags_reroute_single_jobs_to_their_own_key(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -89,21 +89,21 @@ class EvalTests(unittest.TestCase):
             return process
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
-                patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-secret"}):
-            jobs = evals.start_eval({"models": ["deepseek@openai-completions", "minimax-m3@anthropic"],
-                                     "api": "openai-responses", "api_key": "s", "timeout": 2},
+                patch.dict("os.environ", {"OPENCODE_API_KEY": "go-secret",
+                                          "MINIMAX_API_KEY": "mm-secret"}):
+            jobs = evals.start_eval({"models": ["glm-5.3@opencode-go", "minimax-m3@minimax"],
+                                     "provider": "openai", "api_key": "s", "timeout": 2},
                                     Path(directory))
-            self.assertEqual([job["api"] for job in jobs], ["openai-completions", "anthropic"])
-            apis = [next(a for a in p.args if a.startswith("--api=")) for p in processes]
-            self.assertEqual(apis, ["--api=openai-completions", "--api=anthropic"])
-            # A protocol tag keeps the dialog endpoint; a provider tag reroutes.
-            self.assertIn("--base-url=https://api.openai.com/v1", processes[0].args)
-            self.assertIn("--base-url=https://api.anthropic.com/v1", processes[1].args)
-            self.assertEqual(processes[1].kwargs["env"]["CELESTEBENCH_API_KEY"], "ant-secret")
+            self.assertEqual([job["provider"] for job in jobs], ["opencode-go", "minimax"])
+            providers = [next(a for a in p.args if a.startswith("--provider=")) for p in processes]
+            self.assertEqual(providers, ["--provider=opencode-go", "--provider=minimax"])
+            # The dialog key serves the preset provider; tagged runs use their own env.
+            self.assertEqual(processes[0].kwargs["env"]["CELESTEBENCH_API_KEY"], "go-secret")
+            self.assertEqual(processes[1].kwargs["env"]["CELESTEBENCH_API_KEY"], "mm-secret")
             self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
             time.sleep(0.1)
 
-    def test_model_families_auto_route_without_a_tag_on_official_endpoints(self):
+    def test_runs_default_to_the_dialog_provider(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -111,25 +111,12 @@ class EvalTests(unittest.TestCase):
             processes.append(process)
             return process
 
-        with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
-                patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-secret"}):
-            jobs = evals.start_eval(
-                {"models": ["gpt-5.2", "claude-sonnet-4-5", "muse-spark-1.3-contributor"],
-                 "api": "openai-responses", "base_url": "https://api.openai.com/v1",
-                 "key_env": "OPENAI_API_KEY", "api_key": "s", "timeout": 2},
-                Path(directory))
-            self.assertEqual([job["api"] for job in jobs],
-                             ["openai-responses", "anthropic", "openai-responses"])
-            bases = [next(a for a in p.args if a.startswith("--base-url=")) for p in processes]
-            self.assertEqual(bases, ["--base-url=https://api.openai.com/v1",
-                                     "--base-url=https://api.anthropic.com/v1",
-                                     "--base-url=https://api.openai.com/v1"])
-            self.assertEqual(processes[1].kwargs["env"]["CELESTEBENCH_API_KEY"], "ant-secret")
-            # An aggregator endpoint serves every family: no rerouting there.
-            aggregated = evals.start_eval(
-                {"models": ["claude-sonnet-4-5"], "base_url": "https://opencode.ai/zen/go/v1",
-                 "api_key": "s", "timeout": 2}, Path(directory))
-            self.assertEqual(aggregated[0]["api"], "openai-responses")
+        with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
+            jobs = evals.start_eval({"models": ["qwen3.8-flash", "glm-5.3"],
+                                     "provider": "opencode-go", "api_key": "s", "timeout": 2},
+                                    Path(directory))
+            self.assertEqual([job["provider"] for job in jobs], ["opencode-go", "opencode-go"])
+            self.assertTrue(all("--provider=opencode-go" in process.args for process in processes))
             self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
             time.sleep(0.1)
 
@@ -138,20 +125,20 @@ class EvalTests(unittest.TestCase):
                 patch.object(evals.subprocess, "Popen") as launch, \
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": ""}):
             with self.assertRaisesRegex(ValueError, "ANTHROPIC_API_KEY"):
-                evals.start_eval({"models": ["claude-sonnet-4-5"], "api": "openai-responses",
-                                  "base_url": "https://api.openai.com/v1", "api_key": "s",
+                evals.start_eval({"models": ["claude-sonnet-4-6@anthropic"],
+                                  "provider": "opencode-go", "api_key": "s",
                                   "timeout": 2}, Path(directory))
             launch.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_unknown_api_override_starts_nothing(self):
+    def test_unknown_provider_override_starts_nothing(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen") as launch:
             with self.assertRaises(ValueError):
                 evals.start_eval({"models": ["m@grpc"], "api_key": "s"}, Path(directory))
             self.assertEqual(list(Path(directory).iterdir()), [])
             launch.assert_not_called()
 
-    def test_thinking_budget_only_reaches_anthropic_jobs(self):
+    def test_thinking_level_reaches_every_job_without_special_casing(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -161,17 +148,14 @@ class EvalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-secret"}):
-            jobs = evals.start_eval({"models": ["claude@anthropic", "minimax-m3"],
-                                     "api_key": "s", "thinking_budget": 1024}, Path(directory))
-            self.assertEqual([job["api"] for job in jobs], ["anthropic", "openai-responses"])
+            jobs = evals.start_eval({"models": ["claude-sonnet-4-6@anthropic", "glm-5.3"],
+                                     "api_key": "s", "thinking_level": "high", "timeout": 2},
+                                    Path(directory))
             self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
-            anthropic_args = processes[0].args
-            openai_args = processes[1].args
-            self.assertIn("--thinking-budget=1024", anthropic_args)
-            self.assertNotIn("--thinking-budget=1024", openai_args)
+            self.assertTrue(all("--thinking-level=high" in process.args for process in processes))
             time.sleep(0.1)
 
-    def test_runs_apply_per_run_settings_like_effort_and_timeout(self):
+    def test_runs_apply_per_run_settings_like_thinking_and_timeout(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -182,15 +166,15 @@ class EvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
             jobs = evals.start_eval({"harness": "tau", "api_key": "s", "timeout": 10,
                                      "evals": [
-                                         {"model": "gpt-5.2", "reasoning_effort": "low", "timeout": 10},
-                                         {"model": "gpt-5.2", "reasoning_effort": "high",
+                                         {"model": "glm-5.3", "thinking_level": "low", "timeout": 10},
+                                         {"model": "glm-5.3", "thinking_level": "high",
                                           "timeout": 300},
                                      ]}, Path(directory))
-            self.assertEqual([job["model"] for job in jobs], ["gpt-5.2", "gpt-5.2"])
+            self.assertEqual([job["model"] for job in jobs], ["glm-5.3", "glm-5.3"])
             timeout_arg = [next(a for a in p.args if a.startswith("--timeout=")) for p in processes]
             self.assertEqual(timeout_arg, ["--timeout=10", "--timeout=300"])
-            effort_arg = [next(a for a in p.args if a.startswith("--reasoning-effort=")) for p in processes]
-            self.assertEqual(effort_arg, ["--reasoning-effort=low", "--reasoning-effort=high"])
+            level_arg = [next(a for a in p.args if a.startswith("--thinking-level=")) for p in processes]
+            self.assertEqual(level_arg, ["--thinking-level=low", "--thinking-level=high"])
             self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
             time.sleep(0.1)
 
@@ -200,29 +184,6 @@ class EvalTests(unittest.TestCase):
                 evals.start_eval({"evals": [{"model": "m", "sandbox": "off"}], "api_key": "s"},
                                  Path(directory))
             launch.assert_not_called()
-
-    def test_extra_models_queue_until_a_slot_frees(self):
-        gate = threading.Event()
-
-        class Blocking(FakeProcess):
-            def communicate(self):
-                gate.wait(2)
-                return None, ""
-
-        def launch(args, **kwargs):
-            return Blocking(args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
-                patch.object(evals, "_MAX_PROCESSES", 1):
-            jobs = evals.start_eval({"models": ["a", "b"], "api_key": "s", "timeout": 5}, Path(directory))
-            self.assertEqual([job["status"] for job in jobs], ["running", "queued"])
-            queued = next(j for j in evals.list_evals(Path(directory)) if j["model"] == "b")
-            self.assertEqual(queued["elapsed"], 0)
-            evals.stop_eval(jobs[0]["id"])
-            self.wait_until(lambda: jobs[0]["id"] not in evals._processes)
-            self.wait_until(lambda: evals._jobs[jobs[1]["id"]]["status"] == "running")
-            gate.set()
-            self.wait_until(lambda: evals._jobs[jobs[1]["id"]]["status"] == "completed")
 
     def test_stop_cancels_a_queued_evaluation(self):
         gate = threading.Event()
@@ -234,13 +195,14 @@ class EvalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(
                 evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
-                patch.object(evals, "_MAX_PROCESSES", 1):
-            jobs = evals.start_eval({"models": ["a", "b"], "api_key": "s", "timeout": 5}, Path(directory))
-            stopped = evals.stop_eval(jobs[1]["id"])
+                patch.object(evals, "LIMACTL", LIMACTL_OK):
+            jobs = evals.start_eval({"harness": "codex", "models": ["a", "b", "c", "d", "e"],
+                                     "prompt": "x", "timeout": 5}, Path(directory))
+            stopped = evals.stop_eval(jobs[4]["id"])
             self.assertEqual(stopped["status"], "cancelled")
             gate.set()
             self.wait_until(lambda: evals._jobs[jobs[0]["id"]]["status"] == "completed")
-            self.assertEqual(evals._jobs[jobs[1]["id"]]["status"], "cancelled")
+            self.assertEqual(evals._jobs[jobs[4]["id"]]["status"], "cancelled")
 
     def test_start_uses_fresh_rollout_and_keeps_secret_out_of_argv_and_metadata(self):
         process = None
@@ -251,11 +213,12 @@ class EvalTests(unittest.TestCase):
             return process
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
-            jobs = evals.start_eval({"model": "demo/model", "api": "mistral-conversations",
+            jobs = evals.start_eval({"model": "demo/model", "provider": "mistral",
                                      "api_key": "secret-value", "timeout": 2}, Path(directory))
             job = jobs[0]
             time.sleep(0.02)
             self.assertIsNotNone(process)
+            self.assertIn("--provider=mistral", process.args)
             output_arg = next(value for value in process.args if value.startswith("--output="))
             output = Path(output_arg.split("=", 1)[1])
             self.assertFalse(output.exists())
@@ -272,12 +235,28 @@ class EvalTests(unittest.TestCase):
             metadata.mkdir()
             (metadata / "job.json").write_text(json.dumps({
                 "id": "old-job", "name": "demo/run", "model": "demo",
-                "api": "openai-responses", "status": "running",
+                "provider": "opencode-go", "status": "running",
                 "timeout": 60, "decisions": 1, "started_at": time.time(),
             }))
             jobs = evals.list_evals(root)
             self.assertEqual(jobs[0]["status"], "interrupted")
             self.assertIn("stopped", jobs[0]["error"])
+
+    def test_run_readiness_follows_the_first_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".evals").mkdir()
+            (root / ".evals" / "job.json").write_text(json.dumps({
+                "id": "job", "name": "demo/run", "model": "demo",
+                "provider": "opencode-go", "status": "completed", "error": None,
+                "timeout": 60, "decisions": 1, "started_at": time.time(),
+            }))
+            jobs = evals.list_evals(root)
+            self.assertFalse(jobs[0]["run_ready"])
+            folder = root / "demo" / "run"
+            folder.mkdir(parents=True)
+            (folder / "config.json").write_text("{}")
+            self.assertTrue(evals.list_evals(root)[0]["run_ready"])
 
     def test_rejects_bool_fraction_and_nan_budgets_before_writing(self):
         for key, value in (("timeout", True), ("timeout", 0), ("max_images", 2.5), ("fps", float("nan"))):
@@ -326,7 +305,7 @@ class EvalTests(unittest.TestCase):
             self.assertLess(job["elapsed"], 30, "boot time must stay out of the game clock")
             self.assertEqual(job["frames"], 3)
 
-    def test_codex_jobs_run_one_at_a_time_on_the_shared_vm(self):
+    def test_codex_jobs_cap_at_four_and_queue_the_rest(self):
         gate = threading.Event()
 
         class Blocking(FakeProcess):
@@ -337,13 +316,15 @@ class EvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
                 patch.object(evals, "LIMACTL", LIMACTL_OK):
-            jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2"],
+            jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"],
                                      "prompt": "x", "timeout": 5}, Path(directory))
-            self.assertEqual([job["status"] for job in jobs], ["running", "queued"])
+            self.assertEqual([job["status"] for job in jobs],
+                             ["running", "running", "running", "running", "queued"])
             evals.stop_eval(jobs[0]["id"])
-            self.wait_until(lambda: evals._jobs[jobs[1]["id"]]["status"] == "running")
+            self.wait_until(lambda: evals._jobs[jobs[4]["id"]]["status"] == "running")
             gate.set()
-            self.wait_until(lambda: evals._jobs[jobs[1]["id"]]["status"] == "completed")
+            self.wait_until(lambda: all(evals._jobs[job["id"]]["status"] != "running"
+                                        for job in jobs))
 
     def test_codex_harness_launches_the_vm_cli_with_prompt_and_budgets(self):
         processes = []
@@ -360,7 +341,7 @@ class EvalTests(unittest.TestCase):
             job = jobs[0]
             self.assertEqual(job["harness"], "codex")
             args = processes[0].args
-            self.assertIn(str(evals.CODEX_CLI), args)
+            self.assertIn(str(evals.ROOT / evals.HARNESSES["codex"].script), args)
             self.assertIn("run", args)
             self.assertIn("--model=gpt-5.2", args)
             self.assertIn("--prompt=Play the game.", args)
@@ -371,6 +352,39 @@ class EvalTests(unittest.TestCase):
             final = next(j for j in evals.list_evals(Path(directory)) if j["id"] == jobs[0]["id"])
             self.assertEqual(final["status"], "completed")
             time.sleep(0.1)
+
+    def test_codex_runs_carry_reasoning_and_budgets(self):
+        processes = []
+
+        def launch(args, **kwargs):
+            process = FakeProcess(args, **kwargs)
+            processes.append(process)
+            return process
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
+                patch.object(evals, "LIMACTL", LIMACTL_OK):
+            jobs = evals.start_eval({"harness": "codex", "prompt": "x", "max_frames": 5, "evals": [
+                {"model": "gpt-5.2", "thinking_level": "high", "timeout": 45},
+            ]}, Path(directory))
+            args = processes[0].args
+            self.assertIn("--thinking-level=high", args)
+            self.assertIn("--timeout=45", args)
+            self.assertIn("--max-frames=5", args)
+            self.assertIn("--prompt=x", args)
+            self.wait_until(lambda: evals._jobs[jobs[0]["id"]]["status"] == "completed")
+            time.sleep(0.1)
+
+    def test_harness_catalog_describes_every_form_field(self):
+        catalog = {entry["key"]: entry for entry in evals.harness_catalog()}
+        self.assertTrue(catalog["tau"]["builtin"])
+        codex = catalog["codex"]
+        self.assertEqual([field["key"] for field in codex["run"]],
+                         ["model", "thinking_level", "timeout"])
+        self.assertEqual([field["key"] for field in codex["options"]],
+                         ["prompt", "max_frames", "frames", "fps"])
+        thinking = next(field for field in codex["run"] if field["key"] == "thinking_level")
+        self.assertIn("high", [choice["value"] for choice in thinking["choices"]])
+
 
     def test_codex_harness_validation_starts_nothing(self):
         with tempfile.TemporaryDirectory() as directory, \

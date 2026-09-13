@@ -10,6 +10,47 @@ from celestebench import Button, Open8
 
 
 class Open8Test(unittest.TestCase):
+    def test_telemetry_does_not_change_replay_and_detects_death(self):
+        with Open8() as env:
+            env.step(Button.O, 1)
+            env.step(0, 120)
+            checkpoint = env.save_state()
+            missing_player = False
+            for _ in range(180):
+                env.step(Button.RIGHT | Button.O, 1)
+                state = env.game_state
+                missing_player |= not state["alive"]
+            observed = env.framebuffer
+            self.assertGreater(state["deaths"], 0)
+            self.assertTrue(missing_player)
+            env.load_state(checkpoint)
+            env.step(Button.RIGHT | Button.O, 180)
+            np.testing.assert_array_equal(env.framebuffer, observed)
+
+    def test_game_state(self):
+        with Open8() as env:
+            title = env.game_state
+            self.assertEqual(title["room"], 31)
+            self.assertFalse(title["alive"])
+            self.assertFalse(title["grounded"])
+            self.assertIsNone(title["spawn_feet_y"])
+            self.assertEqual(title["deaths"], 0)
+
+            env.step(Button.X, 1)
+            env.step(0, 120)
+            state = env.game_state
+            self.assertEqual(state["room"], 0)
+            self.assertTrue(state["alive"])
+            self.assertTrue(state["grounded"])
+            self.assertEqual(state["feet_y"], 104)
+            self.assertEqual(state["spawn_feet_y"], 104)
+            self.assertEqual(state["exit_feet_y"], 4)
+
+    def test_game_state_is_none_for_other_carts(self):
+        cart = Path(__file__).parents[1] / "deps/open8/export/carts/WOLFHUNT.PNG"
+        with Open8(cart) as env:
+            self.assertIsNone(env.game_state)
+
     def test_rollout(self):
         with tempfile.TemporaryDirectory() as directory, Open8() as env:
             initial = env.framebuffer

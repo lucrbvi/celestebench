@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import math
+import sys
 import time
 from contextlib import suppress
 from operator import index
@@ -12,6 +13,7 @@ from pathlib import Path
 import av
 
 from .open8 import Open8
+from .scoring import Progress
 
 
 def _png(frame) -> bytes:
@@ -75,10 +77,27 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
     stepped = 0
     applied = 0
     calls = 0
+    progress = Progress()
+    scoring_options = dict(timeout=timeout, fps=fps, max_frames=max_frames,
+                           max_actions=max_actions, frames=frames, strict_timeout=strict_timeout)
+
+    def save_score(status):
+        score = {**progress.snapshot(), "elapsed": time.perf_counter() - started,
+                 "frame": stepped, "timing": "wall_clock", "status": status,
+                 "options": scoring_options}
+        temporary = directory / "score.tmp"
+        temporary.write_text(json.dumps(score) + "\n", encoding="utf-8")
+        temporary.replace(directory / "score.json")
+
     with Open8() as env:
         try:
             with (env.record(video), actions.open("w", encoding="utf-8") as history,
-                  (directory / "decisions.jsonl").open("w", encoding="utf-8") as outcomes):
+                  (directory / "decisions.jsonl").open("w", encoding="utf-8") as outcomes,
+                  (directory / "progress.jsonl").open("w", encoding="utf-8") as scores):
+                scores.write(json.dumps({**progress.snapshot(), "frame": 0, "elapsed": 0.0}) + "\n")
+                scores.flush()
+                save_score("running")
+
                 def publish(image):
                     temporary = live.with_suffix(".tmp")
                     temporary.write_bytes(_png(image))
@@ -88,11 +107,16 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
 
                 def observe():
                     unseen.append(frame)
+                    if progress.update(env.game_state):
+                        scores.write(json.dumps({**progress.snapshot(), "frame": stepped,
+                                                 "elapsed": time.perf_counter() - started}) + "\n")
+                        scores.flush()
+                        save_score("running")
 
                 frame = env.step(frames=1)
+                stepped = 1
                 publish(frame)
                 observe()
-                stepped = 1
                 next_tick = time.perf_counter()
 
                 async def tick(buttons):
@@ -253,6 +277,9 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                         decision += 1
 
         finally:
+            failure = sys.exc_info()[1]
+            save_score("cancelled" if isinstance(failure, asyncio.CancelledError)
+                       else "error" if failure is not None else "completed")
             checkpoint.write_bytes(env.save_state())
             live_done.touch()
     return {"frames": stepped, "decisions": calls, "actions": applied,

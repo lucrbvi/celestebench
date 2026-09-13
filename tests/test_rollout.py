@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import PropertyMock, patch
 
 import av
 import numpy as np
@@ -12,6 +13,28 @@ from celestebench.rollout import rollout
 
 
 class RolloutTest(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_records_idle_frames_and_uses_wall_clock(self):
+        async def policy(frames):
+            await asyncio.Event().wait()
+
+        state = dict(room=0, alive=True, grounded=True, feet_y=58,
+                     spawn_feet_y=112, exit_feet_y=4, deaths=0)
+        with tempfile.TemporaryDirectory() as root, patch(
+                "celestebench.open8.Open8.game_state", new_callable=PropertyMock,
+                return_value=state):
+            output = Path(root) / "run"
+            await rollout(policy, output, frames=5, fps=100)
+            events = [json.loads(line) for line in
+                      (output / "progress.jsonl").read_text().splitlines()]
+            score = json.loads((output / "score.json").read_text())
+            self.assertEqual([event["frame"] for event in events], [0, 3])
+            self.assertGreater(events[1]["elapsed"], 0)
+            self.assertLessEqual(events[1]["elapsed"], score["elapsed"])
+            self.assertEqual(score["timing"], "wall_clock")
+            self.assertEqual(score["status"], "completed")
+            self.assertEqual(score["room_progress"], .5)
+            self.assertEqual(score["frame"], 5)
+
     async def test_wait_is_distinct_from_releasing_buttons(self):
         with tempfile.TemporaryDirectory() as root:
             output = Path(root) / "run"
@@ -82,6 +105,7 @@ class RolloutTest(unittest.IsolatedAsyncioTestCase):
                 await rollout(lambda frame: (1, 0), output, frames=3)
             self.assertTrue((output / "rollout.mp4").stat().st_size)
             self.assertEqual(len((output / "checkpoint.state").read_bytes()), 1)
+            self.assertEqual(json.loads((output / "score.json").read_text())["status"], "error")
 
             result = await rollout(policy, Path(root) / "async", frames=2)
             self.assertEqual(result["frames"], 2)

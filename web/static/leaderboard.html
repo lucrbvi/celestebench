@@ -1,0 +1,325 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>leaderboard · celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/runs">runs</a><a href="/evals">evaluations</a><a href="/leaderboard" aria-current="page">leaderboard</a></nav></header>
+<main id="leaderboardPage"><section><h2>leaderboard</h2>
+<label id="budgetControl">budget <select id="budget" aria-label="wall-clock budget"></select></label>
+<div id="leaderboardControls" hidden>
+  <div class="selector">
+    <button id="selectorToggle" type="button" aria-expanded="false">0 of 0 models</button>
+    <div id="selectorPanel" class="selector-panel" hidden>
+      <div class="selector-actions"><button id="selectAll" type="button">all</button><button id="selectNone" type="button">none</button></div>
+      <div id="selectorList"></div>
+    </div>
+  </div>
+  <div class="selector">
+    <button id="harnessToggle" type="button" aria-expanded="false">0 of 0 harnesses</button>
+    <div id="harnessPanel" class="selector-panel" hidden>
+      <div class="selector-actions"><button id="harnessSelectAll" type="button">all</button><button id="harnessSelectNone" type="button">none</button></div>
+      <div id="harnessList"></div>
+    </div>
+  </div>
+  <span id="benchmarkVersion" class="meta"></span>
+</div>
+<div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
+<div id="chartEmpty" class="meta" hidden>no cost data</div>
+<div id="leaderboard" class="table-wrap">loading…</div>
+</section></main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+const LAB_COLORS = {
+  openai: "hsl(210 85% 62%)", anthropic: "hsl(24 80% 62%)", google: "hsl(140 55% 52%)",
+  xai: "hsl(0 0% 78%)", meta: "hsl(270 75% 70%)", zai: "hsl(175 70% 45%)",
+  moonshotai: "hsl(330 80% 68%)", deepseek: "hsl(245 75% 68%)", alibaba: "hsl(45 85% 55%)",
+  minimax: "hsl(358 75% 62%)", xiaomi: "hsl(195 85% 60%)", "nex-agi": "hsl(85 65% 50%)",
+  mistral: "hsl(15 85% 62%)",
+};
+const color = g => {
+  const key = (g && (g.producer || g.model)) || "";
+  if (LAB_COLORS[key]) return LAB_COLORS[key];
+  let h = 0;
+  for (const ch of String(key)) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return `hsl(${h} 68% 62%)`;
+};
+const HARNESS = {
+  tau: { name: "CelesteBench", dash: null, shape: "circle", color: "hsl(210 80% 62%)" },
+  codex: { name: "Codex", dash: "6 3", shape: "square", color: "hsl(285 70% 70%)" },
+};
+const harness = key => HARNESS[key] || { name: key, dash: "1 3", shape: "diamond", color: "hsl(0 0% 65%)" };
+const harnessKey = row => (row.settings || {}).harness || "tau";
+const harnessName = row => harness(harnessKey(row)).name;
+const usd = v => "$" + (v >= 0.01 ? v.toFixed(3) : v.toPrecision(3));
+const level = s => s.thinking_level || s.reasoning_effort || "—";
+const RANK = {off: 0, none: 0, minimal: 1, light: 2, low: 2, medium: 3, high: 4, xhigh: 5, max: 6};
+const rank = s => RANK[String(s.thinking_level || s.reasoning_effort || "").toLowerCase()] ?? 3.5;
+const shortModel = m => String(m).replace(/^.*\//, "").replace(/-contributor$/, "");
+const readSaved = () => { try { return JSON.parse(localStorage.celestebenchModels || "null"); } catch { return null; } };
+const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celestebenchHarnesses || "null"); } catch { return null; } };
+let plottable = [], selectedModels = new Set(), selectedHarnesses = new Set(), scoredRows = [], chartPoints = [];
+
+function logoHtml(row) {
+  const letter = esc(String(row.producer_name || row.model || "?").trim().charAt(0).toUpperCase());
+  const dot = `<span class="logo-fallback" style="--c:${color(row)}"${row.producer ? " hidden" : ""}>${letter}</span>`;
+  if (!row.producer) return dot;
+  return `<img class="logo" src="/logos/${encodeURIComponent(row.producer)}.svg" alt="" onerror="this.hidden=true;this.nextElementSibling.hidden=false">` + dot;
+}
+const models = () => [...new Set(plottable.map(g => g.model))];
+const harnesses = () => [...new Set([...plottable, ...scoredRows].map(harnessKey))];
+function renderSummary() {
+  $("selectorToggle").textContent = `${selectedModels.size} of ${models().length} models`;
+  $("harnessToggle").textContent = `${selectedHarnesses.size} of ${harnesses().length} harnesses`;
+}
+
+function setModels(on) {
+  selectedModels = on ? new Set(models()) : new Set();
+  $("selectorList").querySelectorAll("input").forEach(b => b.checked = on);
+  localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+  renderSummary();
+  renderChart();
+}
+
+function setHarnesses(on) {
+  selectedHarnesses = on ? new Set(harnesses()) : new Set();
+  $("harnessList").querySelectorAll("input").forEach(b => b.checked = on);
+  localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+  renderSummary();
+  renderChart();
+  renderTable();
+}
+
+function buildSelector(groups) {
+  const version = [...new Set(groups.map(g => (g.settings || {}).benchmark_version).filter(Boolean))];
+  $("benchmarkVersion").textContent = version.length ? "CelesteBench v" + version.join(", v") : "";
+  const seen = new Set();
+  $("selectorList").innerHTML = plottable.map(g => {
+    if (seen.has(g.model)) return "";
+    seen.add(g.model);
+    return `<label class="selector-row"><input type="checkbox" data-model="${esc(g.model)}"${selectedModels.has(g.model) ? " checked" : ""}><span class="swatch" style="--c:${color(g)}"></span>${logoHtml(g)}<span class="selector-name">${esc(g.model)}</span><span class="meta">${esc(g.producer_name || "")}</span></label>`;
+  }).join("");
+  $("selectorList").querySelectorAll("input").forEach(box => box.onchange = () => {
+    box.checked ? selectedModels.add(box.dataset.model) : selectedModels.delete(box.dataset.model);
+    localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+    renderSummary();
+    renderChart();
+  });
+  const seenHarnesses = new Set();
+  $("harnessList").innerHTML = [...plottable, ...scoredRows].map(g => {
+    const key = harnessKey(g);
+    if (seenHarnesses.has(key)) return "";
+    seenHarnesses.add(key);
+    const style = harness(key);
+    const swatch = style.shape === "square"
+      ? `<span class="swatch" style="--c:${style.color};border-radius:0"></span>`
+      : `<span class="swatch" style="--c:${style.color};border-radius:50%"></span>`;
+    return `<label class="selector-row"><input type="checkbox" data-harness="${esc(key)}"${selectedHarnesses.has(key) ? " checked" : ""}>${swatch}<span class="selector-name">${esc(style.name)}</span></label>`;
+  }).join("");
+  $("harnessList").querySelectorAll("input").forEach(box => box.onchange = () => {
+    box.checked ? selectedHarnesses.add(box.dataset.harness) : selectedHarnesses.delete(box.dataset.harness);
+    localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+    renderSummary();
+    renderChart();
+    renderTable();
+  });
+  renderSummary();
+}
+
+function renderChart() {
+  const wrap = $("chartWrap"), svg = $("chart");
+  if (!plottable.length) { wrap.hidden = true; $("chartEmpty").hidden = false; return; }
+  wrap.hidden = false; $("chartEmpty").hidden = true;
+  const pts = plottable.filter(g => selectedModels.has(g.model) && selectedHarnesses.has(harnessKey(g)));
+  const base = pts.length ? pts : plottable;
+  const W = 820, H = 380, L = 58, R = 24, T = 20, B = 42;
+  const pw = W - L - R, ph = H - T - B;
+  const logs = base.map(p => Math.log10(p.cost));
+  let lo = Math.min(...logs), hi = Math.max(...logs);
+  if (lo === hi) { lo -= 0.5; hi += 0.5; }
+  const scores = base.map(p => p.progress);
+  const pad = (Math.max(...scores) - Math.min(...scores)) * 0.08 || 1;
+  const y0 = Math.max(0, Math.min(...scores) - pad), y1 = Math.max(...scores) + pad;
+  const X = c => L + (Math.log10(c) - lo) / (hi - lo) * pw;
+  const Y = v => T + ph - (v - y0) / (y1 - y0) * ph;
+  const powers = [];
+  for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) powers.push(10 ** e);
+  const xticks = [...new Set([...powers, 10 ** lo, 10 ** hi].map(v => Number(v.toPrecision(4))))].sort((a, b) => a - b);
+  const yticks = Array.from({ length: 5 }, (_, i) => y0 + (y1 - y0) * i / 4);
+
+  let s = yticks.map(v => `<line x1="${L}" y1="${Y(v)}" x2="${L + pw}" y2="${Y(v)}" stroke="#262626"/>` +
+    `<text x="${L - 8}" y="${Y(v) + 3}" text-anchor="end" fill="#777" font-size="11">${v.toFixed(1)}</text>`).join("");
+  s += xticks.map(v => `<line x1="${X(v)}" y1="${T}" x2="${X(v)}" y2="${T + ph}" stroke="#262626"/>` +
+    `<text x="${X(v)}" y="${T + ph + 16}" text-anchor="middle" fill="#777" font-size="11">${usd(v)}</text>`).join("");
+  s += `<line x1="${L}" y1="${T + ph}" x2="${L + pw}" y2="${T + ph}" stroke="#444"/>` +
+    `<line x1="${L}" y1="${T}" x2="${L}" y2="${T + ph}" stroke="#444"/>` +
+    `<text x="${L + pw / 2}" y="${H - 4}" text-anchor="middle" fill="#999" font-size="12">avg API cost (USD) per rollout</text>` +
+    `<text transform="translate(14 ${T + ph / 2}) rotate(-90)" text-anchor="middle" fill="#999" font-size="12">score (%)</text>`;
+
+  chartPoints = pts;
+  const drawn = new Set();
+  pts.forEach((p, i) => {
+    const style = harness(harnessKey(p));
+    const key = p.model + "|" + harnessKey(p);
+    if (!drawn.has(key)) {
+      drawn.add(key);
+      const rows = pts.filter(q => q.model === p.model && harnessKey(q) === harnessKey(p))
+        .sort((a, b) => rank(a.settings || {}) - rank(b.settings || {}) || a.cost - b.cost);
+      const dash = style.dash ? ` stroke-dasharray="${style.dash}"` : "";
+      if (rows.length > 1) s += `<polyline points="${rows.map(q => `${X(q.cost)},${Y(q.progress)}`).join(" ")}" fill="none" stroke="${color(p)}" stroke-width="1.5" opacity=".75"${dash}/>`;
+    }
+    s += style.shape === "square"
+      ? `<rect x="${X(p.cost) - 3.5}" y="${Y(p.progress) - 3.5}" width="7" height="7" fill="${color(p)}" class="chart-point" data-i="${i}"/>`
+      : `<circle cx="${X(p.cost)}" cy="${Y(p.progress)}" r="4" fill="${color(p)}" class="chart-point" data-i="${i}"/>`;
+  });
+
+  const labels = [];
+  for (const model of models()) {
+    const rows = pts.filter(q => q.model === model);
+    if (!rows.length) continue;
+    const best = rows.reduce((a, b) => (b.progress > a.progress ? b : a));
+    labels.push({ x: X(best.cost), y: Y(best.progress), text: shortModel(model), c: color(best) });
+  }
+  s += labels.map(l => `<g class="lbl" data-ax="${l.x}" data-ay="${l.y}">` +
+    `<text fill="${l.c}" font-size="11" font-family="ui-monospace,monospace">${esc(l.text)}</text></g>`).join("");
+  svg.innerHTML = s;
+  layoutLabels();
+}
+
+function layoutLabels() {
+  const L = 58, R = 24, T = 20, B = 42, W = 820, H = 380;
+  const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
+  const placed = [];
+  const overlaps = (a, b) => !(a.x1 < b.x0 || a.x0 > b.x1 || a.y1 < b.y0 || a.y0 > b.y1);
+  const boxes = [...$("chart").querySelectorAll("g.lbl")]
+    .sort((a, b) => Number(a.dataset.ay) - Number(b.dataset.ay));
+  for (const g of boxes) {
+    const ax = Number(g.dataset.ax), ay = Number(g.dataset.ay);
+    const text = g.querySelector("text");
+    const w = (text.getComputedTextLength ? text.getComputedTextLength() : text.getBBox().width) + 2;
+    const h = 12;
+    const offsets = [];
+    for (const dy of [-3, -12, 6, -21, 15, -30, 24]) offsets.push([9, dy, "start"], [-9, dy, "end"]);
+    let box = null, lx = 0, ly = 0, anchor = "start";
+    for (const [dx, dy, a] of offsets) {
+      const tx = ax + dx, ty = ay + dy;
+      const rect = { x0: a === "start" ? tx : tx - w, x1: a === "start" ? tx + w : tx,
+                     y0: ty - h + 2, y1: ty + 3 };
+      if (rect.x0 < x0 + 2 || rect.x1 > x1 - 2 || rect.y0 < y0 || rect.y1 > y1) continue;
+      if (placed.some(p => overlaps(rect, p))) continue;
+      box = rect; lx = tx; ly = ty; anchor = a; break;
+    }
+    if (!box) {
+      anchor = ax > (x0 + x1) / 2 ? "end" : "start";
+      lx = anchor === "start" ? x0 + 2 : x1 - 2;
+      ly = Math.min(Math.max(ay + 3, y0 + h), y1);
+      const at = () => ({ x0: anchor === "start" ? lx : lx - w,
+                          x1: anchor === "start" ? lx + w : lx, y0: ly - h + 2, y1: ly + 3 });
+      while (placed.some(p => overlaps(at(), p)) && ly < H - 6) ly += h;
+      box = at();
+    }
+    placed.push(box);
+    text.setAttribute("x", lx);
+    text.setAttribute("y", ly);
+    text.setAttribute("text-anchor", anchor);
+  }
+}
+
+$("chart").onmousemove = ev => {
+  const hit = ev.target.closest("[data-i]");
+  const tip = $("chartTooltip");
+  if (!hit) { tip.hidden = true; return; }
+  const p = chartPoints[+hit.dataset.i];
+  const box = $("chartWrap").getBoundingClientRect();
+  tip.innerHTML = `<b style="color:${color(p)}">${esc(p.model)}</b>` +
+    `<div class="meta">${esc(p.producer_name || "unknown")} · ${esc(harnessName(p))} · ${esc(level(p.settings || {}))}</div>` +
+    `<div>${usd(p.cost)} · ${Number(p.progress).toFixed(3)}% · ${p.scored} run${p.scored === 1 ? "" : "s"}</div>`;
+  tip.hidden = false;
+  tip.style.left = Math.max(0, Math.min(ev.clientX - box.left + 12, box.width - 200)) + "px";
+  tip.style.top = Math.max(0, ev.clientY - box.top + 12) + "px";
+};
+$("chart").onmouseleave = () => { $("chartTooltip").hidden = true; };
+$("chart").onclick = ev => {
+  const hit = ev.target.closest("[data-i]");
+  const p = hit && chartPoints[+hit.dataset.i];
+  const runs = (p && p.scored_runs) || [];
+  if (runs.length === 1) location.href = "/runs?run=" + encodeURIComponent(runs[0].name);
+};
+
+async function load() {
+  const value = $("budget").value;
+  const query = value ? "?budget=" + encodeURIComponent(value) : "";
+  const response = await fetch("/api/leaderboard" + query);
+  if (!response.ok) throw Error(`Request failed (${response.status})`);
+  const data = await response.json();
+  $("pollError").textContent = "";
+  const select = $("budget");
+  const budgets = Array.isArray(data.budgets) ? data.budgets : [];
+  $("budgetControl").style.display = budgets.length ? "" : "none";
+  const selected = String(data.budget ?? "");
+  select.innerHTML = budgets.map(b => `<option value="${esc(b)}">${esc(Number(b).toFixed(1))} s</option>`).join("");
+  if (selected) select.value = selected;
+
+  const all = data.groups || [];
+  scoredRows = all.filter(row => row.scored > 0 && Number.isFinite(row.progress));
+  plottable = all.filter(row => row.status === "scored" && row.cost > 0 && Number.isFinite(row.progress));
+
+  const available = models();
+  const saved = readSaved();
+  selectedModels = Array.isArray(saved)
+    ? new Set(available.filter(m => saved.includes(m)))
+    : new Set(available);
+  localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+
+  const availableHarnesses = harnesses();
+  const savedHarnesses = readSavedHarnesses();
+  selectedHarnesses = Array.isArray(savedHarnesses)
+    ? new Set(availableHarnesses.filter(h => savedHarnesses.includes(h)))
+    : new Set(availableHarnesses);
+  localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+
+  $("leaderboardControls").hidden = !available.length;
+  buildSelector(all);
+  renderChart();
+  renderTable();
+}
+
+function renderTable() {
+  const shown = scoredRows.filter(row => selectedHarnesses.has(harnessKey(row)));
+  if (!shown.length) { $("leaderboard").textContent = "no scores"; return; }
+  $("leaderboard").innerHTML = `<table><thead><tr><th>model</th><th>settings</th><th>cost</th><th>progress</th><th>runs</th></tr></thead><tbody>` +
+    shown.map(row => {
+      const s = row.settings || {};
+      const summary = [harnessName(row), level(s), s.fps == null ? "paused" : `${s.fps} FPS`].filter(Boolean).join(" · ");
+      const limits = [s.max_frames == null ? null : `${s.max_frames} frames/action`,
+        s.max_actions == null ? null : `${s.max_actions} actions`].filter(Boolean).join(" · ");
+      const cost = Number.isFinite(row.cost) ? usd(row.cost) : "—";
+      const links = row.scored_runs || [];
+      const name = links.length === 1
+        ? `<a href="/runs?run=${encodeURIComponent(links[0].name)}" title="${esc(links[0].name)}">${esc(row.model)}</a>`
+        : esc(row.model);
+      return `<tr><td>${logoHtml(row)}${name}</td><td class="meta" title="${esc(limits)}">${esc(summary)}</td><td>${cost}</td><td>${Number(row.progress).toFixed(3)}%</td><td>${row.scored}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+}
+
+$("budget").onchange = () => load().catch(error => $("pollError").textContent = error.message);
+const togglePanel = (button, panel, otherPanel, otherButton) => {
+  panel.hidden = !panel.hidden;
+  button.setAttribute("aria-expanded", String(!panel.hidden));
+  if (!panel.hidden && !otherPanel.hidden) {
+    otherPanel.hidden = true;
+    otherButton.setAttribute("aria-expanded", "false");
+  }
+};
+$("selectorToggle").onclick = () => togglePanel($("selectorToggle"), $("selectorPanel"), $("harnessPanel"), $("harnessToggle"));
+$("harnessToggle").onclick = () => togglePanel($("harnessToggle"), $("harnessPanel"), $("selectorPanel"), $("selectorToggle"));
+document.addEventListener("click", ev => {
+  if (ev.target.closest(".selector")) return;
+  [["selectorPanel", "selectorToggle"], ["harnessPanel", "harnessToggle"]].forEach(([panel, toggle]) => {
+    if (!$(panel).hidden) togglePanel($(toggle), $(panel));
+  });
+});
+$("selectAll").onclick = () => setModels(true);
+$("selectNone").onclick = () => setModels(false);
+$("harnessSelectAll").onclick = () => setHarnesses(true);
+$("harnessSelectNone").onclick = () => setHarnesses(false);
+load().catch(error => $("pollError").textContent = error.message);
+</script></body></html>

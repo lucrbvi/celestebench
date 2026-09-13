@@ -12,13 +12,14 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from celestebench.harnesses import HARNESSES
+
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "examples" / "llm.py"
-CODEX_CLI = ROOT / "examples" / "codex_vm.py"
 
 
 def _find_limactl() -> Path:
@@ -32,40 +33,99 @@ def _find_limactl() -> Path:
 
 
 LIMACTL = _find_limactl()
-APIS = ("openai-responses", "openai-completions", "anthropic",
-        "google-generative-ai", "mistral-conversations")
-# A provider tag reroutes a model line to the official endpoint and key env.
-PROVIDERS = {
-    "openai": {"api": "openai-responses", "base_url": "https://api.openai.com/v1",
-               "key_env": "OPENAI_API_KEY"},
-    "anthropic": {"api": "anthropic", "base_url": "https://api.anthropic.com/v1",
-                  "key_env": "ANTHROPIC_API_KEY"},
-    "google": {"api": "google-generative-ai",
-               "base_url": "https://generativelanguage.googleapis.com/v1beta",
-               "key_env": "GEMINI_API_KEY"},
-    "mistral": {"api": "mistral-conversations", "base_url": "https://api.mistral.ai/v1",
-                "key_env": "MISTRAL_API_KEY"},
-}
-FAMILIES = {"claude": "anthropic", "gemini": "google", "gemma": "google",
-            "gpt": "openai", "codex": "openai", "o1": "openai", "o3": "openai",
-            "o4": "openai", "mistral": "mistral", "magistral": "mistral",
-            "codestral": "mistral", "ministral": "mistral", "pixtral": "mistral"}
-_OFFICIAL = {(p["api"], p["base_url"]): tag for tag, p in PROVIDERS.items()}
-_MAX_PROCESSES = 4
 _lock = threading.RLock()
 _jobs = {}
 _processes = {}
 
 
-def _routing(model, override, api, base_url):
-    """Per-model provider settings, or None to keep the dialog endpoint."""
-    if override:
-        return (PROVIDERS.get(override) or {"api": override}).copy()
-    family = PROVIDERS.get(FAMILIES.get(re.split(r"[-_.:/@]", model, 1)[0].lower(), ""))
-    if (api, base_url) in _OFFICIAL and family and (api, base_url) != (
-            family["api"], family["base_url"]):
-        return family.copy()
-    return None
+def _provider_env(provider):
+    """Resolve a provider name to its key environment variable, or fail loudly."""
+    from celestebench import providers
+    try:
+        return providers.key_env(provider)
+    except ValueError:
+        raise ValueError(f"Unknown provider '{provider}'; use one of "
+                         f"{', '.join((*providers.provider_names(), providers.CUSTOM))}.") from None
+
+
+def _thinking_level(value):
+    from tau_coding.thinking import normalize_thinking_level
+    return normalize_thinking_level(value)
+
+
+def _harness(name):
+    return HARNESSES.get(name) or HARNESSES["tau"]
+
+
+_REQUIREMENTS = {"limactl": lambda: LIMACTL.is_file()}
+
+
+def _require(harness):
+    """Refuse an external harness whose host tool is missing."""
+    check = _REQUIREMENTS.get(harness.requires)
+    if harness.requires and (check is None or not check()):
+        raise RuntimeError(f"Install {harness.requires} before launching {harness.label}.")
+
+
+def _field_value(field, value):
+    """Validate one registry field value, or return None when it is left out."""
+    if value is None:
+        if field.required:
+            raise ValueError(f"Enter {field.label}.")
+        return None
+    if field.kind == "bool":
+        if type(value) is not bool:
+            raise ValueError(f"{field.label} must be true or false.")
+        return value
+    if field.kind == "choice":
+        if value not in field.choices:
+            raise ValueError(f"Invalid {field.label}.")
+        return value
+    if field.kind in {"int", "number"}:
+        if (type(value) not in {int, float} or isinstance(value, bool)
+                or not math.isfinite(value) or value < field.minimum
+                or field.kind == "int" and type(value) is not int):
+            raise ValueError(f"Invalid {field.label}.")
+        return value
+    if not isinstance(value, str) or "\0" in value:
+        raise ValueError(f"Invalid {field.label}.")
+    if field.required and not value.strip():
+        raise ValueError(f"Enter {field.label}.")
+    return value
+
+
+def _harness_flags(harness, options):
+    """Command-line flags for an external harness; booleans are bare switches."""
+    flags = []
+    for field in (*harness.run, *harness.options):
+        if field.key == "model" or field.key not in options:
+            continue
+        name = "--" + field.key.replace("_", "-")
+        if field.kind == "bool":
+            if options[field.key]:
+                flags.append(name)
+        else:
+            flags.append(f"{name}={options[field.key]}")
+    return flags
+
+
+def harness_catalog():
+    """Harness descriptors for the new-eval form, with dynamic choice lists."""
+    choices = []
+    if _support_tau_ai() is not None:
+        from celestebench import providers
+        choices = [{"value": name, "label": name} for name in providers.provider_names()]
+    choices.append({"value": "custom", "label": "custom endpoint"})
+    catalog = []
+    for harness in HARNESSES.values():
+        entry = {"key": harness.key, "label": harness.label, "builtin": harness.builtin,
+                 "note": harness.note, "run": [field.spec() for field in harness.run],
+                 "options": [field.spec() for field in harness.options]}
+        for field in entry["run"] + entry["options"]:
+            field["choices"] = choices if field["source"] == "providers" else [
+                {"value": value, "label": value} for value in field["choices"]]
+        catalog.append(entry)
+    return catalog
 
 
 def _rows(path):
@@ -94,8 +154,12 @@ def _write(job):
 
 
 def _progress(job):
-    folder = Path(job["_folder"]) / "rollout" if job.get("harness") == "codex" else Path(job["_folder"])
+    harness = _harness(job.get("harness"))
+    folder = Path(job["_folder"]) / "rollout" if harness.nested else Path(job["_folder"])
     engine = folder / "decisions.jsonl"
+    # The viewer only lists a run once its engine wrote config.json, so the
+    # evaluation tab may link to it from that moment on.
+    job["run_ready"] = (folder / "config.json").is_file()
     if job["status"] == "queued":
         job.update(decisions=0, frames=0, elapsed=0, tokens=None, engine=True)
         return
@@ -129,18 +193,19 @@ def _watch(job, proc, secret):
             lines = (stderr or "").strip().splitlines()
             last = lines[-1][-1000:] if lines else f"Evaluation exited with code {proc.returncode}."
             job["error"] = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception): ", "", last)
-        if job["status"] == "failed" and job.get("harness") == "codex":
-            # The guest Codex CLI reports its own whole failures in the JSON trace
+        harness = _harness(job.get("harness"))
+        if job["status"] == "failed" and harness.trace:
+            # The guest CLI reports its own whole failures in the JSON trace
             # (e.g. an authentication problem), which reads much better than the
             # process traceback.
-            messages = [row.get("message") for row in _rows(Path(job["_folder"]) / "codex.jsonl")
+            messages = [row.get("message") for row in _rows(Path(job["_folder"]) / harness.trace)
                         if row.get("type") == "error" and row.get("message")]
             if messages:
                 job["error"] = messages[-1]
-                if ("authorizat" in job["error"].lower()
-                        or "authentication" in job["error"].lower()):
-                    job["error"] += (" — the viewer VM has no Codex access yet;"
-                                     " run examples/codex_vm.py login once")
+                if harness.login_hint and ("authorizat" in job["error"].lower()
+                                           or "authentication" in job["error"].lower()):
+                    job["error"] += (f" — {harness.label} has no access in the viewer yet;"
+                                     f" {harness.login_hint}")
         _progress(job)
         _write(job)
         _processes.pop(job["id"], None)
@@ -149,21 +214,17 @@ def _watch(job, proc, secret):
 
 def _launch(job, options, secret):
     """Spawn the harness subprocess. Caller holds the lock; job becomes running."""
-    if job["harness"] == "codex":
-        args = [sys.executable, str(CODEX_CLI), "run", f"--output={job['_folder']}",
-                f"--model={job['model']}", f"--timeout={options['timeout']}",
-                f"--max-frames={options['max_frames']}",
-                f"--prompt={options['prompt']}"]
-        if options.get("frames"):
-            args.append(f"--frames={options['frames']}")
-        if options.get("lite"):
-            args.append("--lite")
-        env = os.environ.copy()
-    else:
+    harness = _harness(job["harness"])
+    if harness.builtin:
         args = [sys.executable, str(CLI), f"--output={job['_folder']}", f"--model={job['model']}"]
         args += [f"--{key.replace('_', '-')}={value}" for key, value in options.items()]
         env = os.environ.copy()
         env["CELESTEBENCH_API_KEY"] = secret
+    else:
+        args = [sys.executable, str(ROOT / harness.script), *harness.command,
+                f"--output={job['_folder']}", f"--model={job['model']}"]
+        args += _harness_flags(harness, options)
+        env = os.environ.copy()
     job["status"], job["started_at"], job["error"] = "running", time.time(), None
     _write(job)
     try:
@@ -180,37 +241,37 @@ def _launch(job, options, secret):
 
 
 def _pump():
-    """Start queued evaluations in submission order while a process slot is free."""
+    """Start queued evaluations in submission order, up to each harness's cap."""
     with _lock:
-        codex_running = any(_jobs[_id].get("harness") == "codex" for _id in _processes)
+        busy = {}
+        for _id in _processes:
+            key = _harness(_jobs[_id].get("harness")).key
+            busy[key] = busy.get(key, 0) + 1
         for job in list(_jobs.values()):
-            if len(_processes) >= _MAX_PROCESSES:
-                break
             if job["status"] != "queued":
                 continue
-            # One Codex CLI evaluation at a time: they share the single VM and port.
-            if job.get("harness") == "codex":
-                if codex_running:
-                    continue
-                codex_running = True
+            harness = _harness(job.get("harness"))
+            # Capped harnesses share the same VM or port; wait for a free slot.
+            if harness.concurrency and busy.get(harness.key, 0) >= harness.concurrency:
+                continue
             options, secret = job.pop("_options", None), job.pop("_secret", None)
             if options is None:
                 job.update(status="failed", error="Queued evaluation lost its settings.",
                            finished_at=time.time())
                 continue
+            busy[harness.key] = busy.get(harness.key, 0) + 1
             _launch(job, options, secret)
 
 
-def _run_rows(payload, codex=False):
+def _run_rows(payload, harness):
     """Per-run dicts; legacy `models` strings become one row each."""
     rows = payload.get("evals")
     if rows is None:
         return [{"model": model} if override is None else {"model": model, "tag": override}
-                for model, override in _model_entries(payload, codex=codex)]
+                for model, override in _model_entries(payload, harness)]
     if not isinstance(rows, list) or not rows or len(rows) > 24:
         raise ValueError("Provide one to 24 runs.")
-    allowed = {"model", "timeout"} if codex else {"model", "tag", "reasoning_effort",
-                                                  "thinking_budget", "timeout", "max_frames"}
+    allowed = {field.key for field in harness.run} | ({"tag"} if harness.builtin else set())
     parsed = []
     for row in rows:
         if not isinstance(row, dict):
@@ -222,13 +283,13 @@ def _run_rows(payload, codex=False):
         if (not isinstance(model, str) or not model.strip() or not model or len(model) > 200
                 or any(ord(c) < 32 for c in model)):
             raise ValueError("Enter a model identifier in every run.")
-        if codex and row.get("tag"):
-            raise ValueError("Provider overrides do not apply to the Codex harness.")
+        if not harness.builtin and row.get("tag"):
+            raise ValueError(f"Provider overrides do not apply to the {harness.label} harness.")
         parsed.append(dict(row))
     return parsed
 
 
-def _model_entries(payload, codex=False):
+def _model_entries(payload, harness):
     models = payload.get("models", [payload.get("model")])
     if not isinstance(models, list) or not models or len(models) > 24:
         raise ValueError("Provide one to 24 models.")
@@ -240,20 +301,31 @@ def _model_entries(payload, codex=False):
         model, sep, override = raw.partition("@")
         if not model or len(model) > 200 or any(ord(c) < 32 for c in model):
             raise ValueError("Enter a model identifier on every line.")
-        if override and (codex or override not in APIS and override not in PROVIDERS):
-            raise ValueError(f"Unknown API '{override}' for model '{model}';"
-                             f" use one of {', '.join((*APIS, *PROVIDERS))}.")
+        if override and not harness.builtin:
+            raise ValueError(f"Provider overrides do not apply to the {harness.label} harness.")
+        if override and not _known_provider(override):
+            raise ValueError(f"Unknown provider '{override}' for model '{model}';"
+                             f" use one of {_provider_choices()}.")
         entries.append((model, override or None))
     if not entries:
         raise ValueError("Enter a model identifier on every line.")
     return entries
 
 
+def _known_provider(name):
+    from celestebench import providers
+    return name != providers.CUSTOM and name in providers.provider_names()
+
+
+def _provider_choices():
+    from celestebench import providers
+    return ", ".join((*providers.provider_names(), providers.CUSTOM))
+
+
 def _positive(payload, key, default, integer=False):
     value = payload.get(key, default)
     if (type(value) not in {int, float} or isinstance(value, bool)
             or not math.isfinite(value) or value <= 0
-            or key == "thinking_budget" and type(value) is not int
             or integer and type(value) is not int):
         raise ValueError("timeout must be a positive number of seconds." if key == "timeout"
                          else f"Invalid {key} budget.")
@@ -263,7 +335,7 @@ def _positive(payload, key, default, integer=False):
 def _enqueue(runs, harness, plans):
     runs = Path(runs).resolve()
     with _lock:
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
+        stamp = datetime.now(UTC).strftime("%Y-%m-%d-%H-%M-%S")
         jobs = []
         for model, entry_options, secret in plans:
             job_id = uuid.uuid4().hex
@@ -274,15 +346,16 @@ def _enqueue(runs, harness, plans):
             meta.parent.mkdir(parents=True, exist_ok=True)
             folder.parent.mkdir(parents=True, exist_ok=True)
             job = {"id": job_id, "name": name, "model": model, "harness": harness,
-                   "api": entry_options.get("api"), "status": "queued", "error": None,
+                   "provider": entry_options.get("provider"), "status": "queued", "error": None,
                    "decisions": 0, "timeout": entry_options["timeout"], "frames": 0,
                    "elapsed": 0, "tokens": None, "started_at": time.time(),
                    "_folder": str(folder), "_meta": str(meta)}
             # Options and the secret stay in memory only; never persisted to disk.
-            # Codex evaluations queue even with free slots: one VM, one port.
-            if (harness == "codex"
-                    and any(_jobs[_id].get("harness") == "codex" for _id in _processes)
-                    or len(_processes) >= _MAX_PROCESSES):
+            # Capped harnesses queue once their share of the VM is running.
+            limit = HARNESSES[harness].concurrency
+            running = sum(1 for _id in _processes
+                          if _harness(_jobs[_id].get("harness")).key == harness)
+            if limit and running >= limit:
                 job["_options"], job["_secret"] = entry_options, secret
                 _write(job)
             else:
@@ -299,112 +372,98 @@ def _support_tau_ai():
 def start_eval(payload, runs):
     if not isinstance(payload, dict):
         raise ValueError("Unknown evaluation settings.")
-    harness = payload.get("harness", "tau")
-    if harness == "codex":
-        return _codex_jobs(payload, runs)
-    if harness != "tau":
+    name = payload.get("harness", "tau")
+    if name not in HARNESSES:
         raise ValueError("Unknown harness.")
+    harness = HARNESSES[name]
+    return _tau_jobs(harness, payload, runs) if harness.builtin else _external_jobs(
+        harness, payload, runs)
+
+
+def _tau_jobs(harness, payload, runs):
+    if _support_tau_ai() is None:
+        raise RuntimeError("Install LLM support: uv sync --extra llm; then restart the viewer.")
     defaults = {"timeout": 120, "max_frames": 30, "max_actions": 4, "max_images": 3}
-    allowed = set(defaults) | {"harness", "evals", "model", "models", "api", "base_url",
-                               "key_env", "api_key", "fps", "reasoning_effort",
-                               "thinking_budget"}
+    allowed = set(defaults) | {"harness", "evals", "model", "models", "provider",
+                               "base_url", "api_key", "fps", "thinking_level"}
     if set(payload) - allowed:
         raise ValueError("Unknown evaluation settings.")
-    rows = _run_rows(payload)
-    api = payload.get("api", "openai-responses")
-    if api not in APIS:
-        raise ValueError("Unknown API protocol.")
-    base_url = payload.get("base_url", {
-        "anthropic": "https://api.anthropic.com/v1",
-        "google-generative-ai": "https://generativelanguage.googleapis.com/v1beta",
-        "mistral-conversations": "https://api.mistral.ai/v1",
-    }.get(api, "https://api.openai.com/v1"))
-    if not isinstance(base_url, str):
-        raise ValueError("Enter an HTTP(S) base URL.")
-    parsed = urlsplit(base_url)
-    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username
-            or parsed.password or parsed.query or parsed.fragment or any(c.isspace() for c in base_url)):
-        raise ValueError("Base URL must be HTTP(S), without credentials, query or fragment.")
-    key_env = payload.get("key_env") or {
-        "anthropic": "ANTHROPIC_API_KEY", "google-generative-ai": "GEMINI_API_KEY",
-        "mistral-conversations": "MISTRAL_API_KEY",
-    }.get(api, "OPENAI_API_KEY")
-    if not isinstance(key_env, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key_env):
-        raise ValueError("Invalid key environment variable name.")
-    secret = payload.get("api_key") or os.environ.get(key_env)
+    rows = _run_rows(payload, harness)
+    provider = payload.get("provider", "opencode-go")
+    base_url = payload.get("base_url")
+    if base_url is not None:
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("Enter an HTTP(S) base URL.")
+        parsed = urlsplit(base_url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment
+                or any(c.isspace() for c in base_url)):
+            raise ValueError("Base URL must be HTTP(S), without credentials, query or fragment.")
+    elif provider == "custom":
+        raise ValueError("Custom providers need a base URL.")
+    key_env_name = _provider_env(provider)
+    secret = payload.get("api_key")
     if not isinstance(secret, str) or not secret or "\0" in secret:
-        raise ValueError(f"Enter an API key or set {key_env} before starting the viewer.")
-    options = {"api": api, "base_url": base_url, "key_env": "CELESTEBENCH_API_KEY"}
+        secret = os.environ.get(key_env_name)
+    if not isinstance(secret, str) or not secret or "\0" in secret:
+        raise ValueError(f"Enter an API key or set {key_env_name} before starting the viewer.")
+    options = {"provider": provider, "thinking_level": _thinking_level(
+        payload.get("thinking_level", "low"))}
+    if base_url is not None:
+        options["base_url"] = base_url
     for key, integer in (("max_frames", True), ("max_actions", True), ("max_images", True),
                          ("timeout", False)):
         options[key] = _positive(payload, key, defaults[key], integer=integer)
-    for key in ("thinking_budget", "fps"):
-        if payload.get(key) is not None:
-            options[key] = _positive(payload, key, 1)
-    # Tau resolves the output budget itself (and raises it for thinking), so
-    # only the provider choice for thinking needs validation here. The flag is
-    # only forwarded to anthropic-routed jobs; other providers have no such knob.
-    effort = payload.get("reasoning_effort", "low")
-    if not isinstance(effort, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", effort):
-        raise ValueError("Invalid reasoning effort.")
-    options["reasoning_effort"] = effort
-    if _support_tau_ai() is None:
-        raise RuntimeError("Install LLM support: uv sync --extra llm; then restart the viewer.")
+    if payload.get("fps") is not None:
+        options["fps"] = _positive(payload, "fps", 1)
 
     # Resolve every run's endpoint and key before touching the filesystem.
     plans = []
     for row in rows:
         model, override = row["model"], row.get("tag")
-        routing = _routing(model, override, api, base_url)
         entry_options, entry_secret = dict(options), secret
-        for key in ("timeout", "max_frames"):
-            if row.get(key) is not None:
-                entry_options[key] = _positive(row, key, entry_options[key],
-                                               integer=key != "timeout")
-        for key in ("thinking_budget", "reasoning_effort"):
-            if row.get(key) is None:
-                continue
-            value = row[key]
-            if key == "thinking_budget":
-                entry_options[key] = _positive(row, key, 1)
-            elif not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", value):
-                raise ValueError("Invalid reasoning effort.")
-            else:
-                entry_options[key] = value
-        if routing:
-            entry_options["api"] = routing["api"]
-            if "base_url" in routing:  # provider tag or inferred family: official route
-                entry_options["base_url"] = routing["base_url"]
-                entry_secret = os.environ.get(routing["key_env"])
-                if not entry_secret:
-                    raise ValueError(f"Set {routing['key_env']} to launch {model} on the "
-                                     f"{routing['api']} API.")
-        if entry_options["api"] != "anthropic":
-            entry_options.pop("thinking_budget", None)
+        if row.get("timeout") is not None:
+            entry_options["timeout"] = _positive(row, "timeout", entry_options["timeout"])
+        if row.get("thinking_level") is not None:
+            entry_options["thinking_level"] = _thinking_level(row["thinking_level"])
+        if override is not None and override != provider:
+            # A provider tag reroutes the run to that provider's own key env.
+            entry_options["provider"] = override
+            entry_secret = os.environ.get(_provider_env(override))
+            if not entry_secret:
+                raise ValueError(f"Set {_provider_env(override)} to launch {model} on {override}.")
         plans.append((model, entry_options, entry_secret))
-    return _enqueue(runs, "tau", plans)
+    return _enqueue(runs, harness.key, plans)
 
 
-def _codex_jobs(payload, runs):
-    allowed = {"harness", "evals", "model", "models", "prompt", "timeout", "max_frames",
-               "frames", "lite"}
+def _external_jobs(harness, payload, runs):
+    allowed = {"harness", "evals", "model", "models"} | {
+        field.key for field in (*harness.run, *harness.options)}
     if set(payload) - allowed:
-        raise ValueError("Unknown Codex evaluation settings.")
-    prompt = payload.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 60000 or "\0" in prompt:
-        raise ValueError("Write a task prompt for the Codex evaluation.")
-    options = {"timeout": _positive(payload, "timeout", 120),
-               "max_frames": _positive(payload, "max_frames", 30, integer=True),
-               "prompt": prompt}
-    if payload.get("frames") is not None:
-        options["frames"] = _positive(payload, "frames", 1, integer=True)
-    if payload.get("lite"):
-        options["lite"] = True
-    if not LIMACTL.is_file():
-        raise RuntimeError("Install Lima before launching a Codex evaluation: brew install lima.")
-    rows = _run_rows(payload, codex=True)
-    return _enqueue(runs, "codex", [(row["model"], {**options, "timeout": _positive(
-        row, "timeout", options["timeout"])}, None) for row in rows])
+        raise ValueError(f"Unknown {harness.label} evaluation settings.")
+    _require(harness)
+    options = {field.key: _field_value(field, payload.get(field.key, field.default))
+               for field in harness.options}
+    # Top-level run fields are shared defaults; each row may override them.
+    defaults = {field.key: _field_value(field, payload.get(field.key, field.default))
+                for field in harness.run if field.key != "model"}
+    options = {key: value for key, value in options.items() if value is not None}
+    rows = _run_rows(payload, harness)
+    plans = []
+    for row in rows:
+        entry_options = options | {key: value for key, value in defaults.items() if value is not None}
+        for field in harness.run:
+            if field.key != "model" and row.get(field.key) is not None:
+                entry_options[field.key] = _field_value(field, row[field.key])
+        plans.append((row["model"], entry_options, None))
+    return _enqueue(runs, harness.key, plans)
+
+
+def job_running(job_id):
+    """Whether a live job can still produce frames; lets a stream end early."""
+    with _lock:
+        job = _jobs.get(job_id)
+        return job is not None and job["status"] == "running"
 
 
 def list_evals(runs):

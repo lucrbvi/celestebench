@@ -1,13 +1,16 @@
-import json
-import io
 import http.client
+import io
+import json
 import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from web import viewer
+import av
+import numpy as np
+
+from web import export, viewer
 
 
 class ViewerTest(unittest.TestCase):
@@ -53,6 +56,45 @@ class ViewerTest(unittest.TestCase):
             self.assertEqual(data["decisions"][1]["status"], "timeout")
             self.assertAlmostEqual(data["decisions"][1]["from"], 6 / 30)
             self.assertEqual(data["decisions"][1]["actions"], [])
+
+    def test_codex_trace_is_merged_into_the_nested_rollout(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "gpt" / "run"
+            rollout = wrapper / "rollout"
+            rollout.mkdir(parents=True)
+            (wrapper / "config.json").write_text(json.dumps({"model": "gpt"}))
+            (rollout / "config.json").write_text(json.dumps({"model": "gpt"}))
+            (rollout / "decisions.jsonl").write_text('\n'.join(json.dumps({
+                "decision": index, "status": "played", "frame_start": start, "frame_end": end,
+            }) for index, (start, end) in enumerate([(1, 60), (60, 200)])) + "\n")
+            (rollout / "actions.jsonl").write_text('\n'.join(json.dumps({
+                "decision": index, "buttons": 1, "frames": 2, "frame_start": start,
+                "frame_end": start + 2}) for index, start in enumerate([1, 60])) + "\n")
+            (wrapper / "codex.jsonl").write_text('\n'.join(json.dumps(row) for row in [
+                {"type": "item.completed", "item": {"type": "reasoning", "text": "plan one"}},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "go"}},
+                {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "play",
+                 "arguments": {"actions": [{"buttons": 1, "frames": 2}]},
+                 "result": {"content": [{"type": "text", "text": json.dumps({"frame_ids": [60]})}]}}},
+                {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "observe",
+                 "arguments": {}}},
+                {"type": "item.completed", "item": {"type": "reasoning", "text": "plan two"}},
+                {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "play",
+                 "arguments": {"actions": [{"buttons": 2, "frames": 1}]},
+                 "result": {"content": [{"type": "text", "text": json.dumps({"frame_ids": [200]})}]}}},
+                {"type": "item.completed", "item": {"type": "mcp_tool_call", "tool": "play",
+                 "arguments": {"actions": [{"buttons": 0, "frames": 1}]},
+                 "result": {"content": [{"type": "text", "text": "Error executing tool play"}]}}},
+            ]) + "\n")
+            with patch.object(viewer, "RUNS", root):
+                decisions = viewer.load_decisions("gpt/run")["decisions"]
+            self.assertEqual(len(decisions), 2)
+            self.assertEqual(decisions[0]["thinking"], "plan one")
+            self.assertEqual(decisions[0]["text"], "go")
+            self.assertEqual(decisions[0]["tool"], {"actions": [{"buttons": 1, "frames": 2}]})
+            self.assertEqual(decisions[1]["thinking"], "plan two")
+            self.assertEqual(decisions[1]["tool"], {"actions": [{"buttons": 2, "frames": 1}]})
 
     def test_legacy_actions_are_approximate_and_start_after_observation_frame(self):
         with TemporaryDirectory() as tmp:
@@ -101,6 +143,62 @@ class ViewerTest(unittest.TestCase):
                 fake.headers = {}
                 viewer.Handler.do_GET(fake)
                 self.assertEqual(fake.status, 404)
+
+    def test_live_stream_waits_for_a_late_frame_and_ends_with_the_job(self):
+        class Fake:
+            close_connection = False
+            connection = type("Connection", (), {"settimeout": lambda self, value: None})()
+            wfile = io.BytesIO()
+            status = None
+            def send_response(self, status): self.status = status
+            def send_header(self, name, value): pass
+            def end_headers(self): pass
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "run"
+            folder.mkdir()
+            fake = Fake()
+            calls = {"count": 0}
+            def running():
+                calls["count"] += 1
+                return calls["count"] < 3
+            # No frame on disk yet: the stream must stay open while the job runs,
+            # then stop on its own when the harness reports completion.
+            viewer.Handler.live(fake, folder, running)
+            self.assertEqual(fake.status, 200)
+            self.assertTrue(fake.wfile.getvalue().endswith(b"--frame--\r\n"))
+
+    def test_live_stream_finds_a_nested_rollout_created_after_it_opens(self):
+        class Fake:
+            close_connection = False
+            connection = type("Connection", (), {"settimeout": lambda self, value: None})()
+            wfile = io.BytesIO()
+            status = None
+            def send_response(self, status): self.status = status
+            def send_header(self, name, value): pass
+            def end_headers(self): pass
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "run"
+            folder.mkdir()
+            frame = b"\x89PNG\r\nnested"
+            calls = {"count": 0}
+            def running():
+                calls["count"] += 1
+                if calls["count"] == 2:  # the harness starts the game mid-stream
+                    rollout = folder / "rollout"
+                    rollout.mkdir()
+                    (rollout / "live.png").write_bytes(frame)
+                    (rollout / "live.done").touch()
+                return calls["count"] < 4
+            fake = Fake()
+            viewer.Handler.live(fake, folder, running)
+            self.assertIn(frame, fake.wfile.getvalue())
+
+    def test_job_running_only_reports_live_jobs(self):
+        with patch.dict(viewer.evals._jobs, {
+                "alive": {"status": "running"}, "done": {"status": "completed"}}):
+            self.assertTrue(viewer.evals.job_running("alive"))
+            self.assertFalse(viewer.evals.job_running("done"))
+            self.assertFalse(viewer.evals.job_running("missing"))
 
     def test_timeout_reasoning_without_video_and_legacy_batch_order(self):
         with TemporaryDirectory() as tmp:
@@ -158,6 +256,209 @@ class ViewerTest(unittest.TestCase):
                 action = viewer.load_decisions("run")["decisions"][0]["actions"][0]
             self.assertTrue(action["wait"])
 
+    def test_leaderboard_uses_one_wall_clock_event_and_keeps_unscored_runs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, progress, actions in (("a", 40, 4), ("b", 60, 4), ("different", 90, 2)):
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({
+                    "fps": 30, "max_actions": actions, "max_frames": 30,
+                }))
+                (folder / "score.json").write_text(json.dumps({
+                    "version": 1, "metric": "grounded_height_v1", "progress": progress,
+                    "status": "completed",
+                    "elapsed": 10, "timing": "wall_clock",
+                }))
+                (folder / "progress.jsonl").write_text("\n".join(json.dumps(row) for row in [
+                    {"elapsed": 5, "progress": progress - 10},
+                    {"elapsed": 10, "progress": progress},
+                ]))
+                runs.append({"name": name, "model": "model", "harness": "tau",
+                             "status": "completed", "timeout": 10, "elapsed": 10})
+            short = root / "short"
+            short.mkdir()
+            (short / "config.json").write_text(json.dumps({"fps": 30, "max_actions": 4,
+                                                            "max_frames": 30}))
+            (short / "score.json").write_text(json.dumps({
+                "version": 1, "metric": "grounded_height_v1", "progress": 80,
+                "elapsed": 4, "timing": "wall_clock", "status": "completed",
+            }))
+            (short / "progress.jsonl").write_text(json.dumps({"elapsed": 4, "progress": 80}))
+            runs.append({"name": "short", "model": "model", "harness": "tau",
+                         "status": "completed", "timeout": 10, "elapsed": 4})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            self.assertEqual(result["excluded"], {"replay": 0, "unknown_timing": 0})
+            grouped = {(row["settings"]["max_actions"]): row for row in result["groups"]}
+            self.assertEqual(grouped[4]["progress"], 50)
+            self.assertEqual(grouped[4]["scored"], 2)
+            self.assertEqual(grouped[4]["unscored"], 1)
+            self.assertEqual(grouped[4]["scored_runs"], [{"name": "b", "progress": 60},
+                                                         {"name": "a", "progress": 40}])
+            self.assertEqual(grouped[2]["progress"], 90)
+            self.assertEqual(grouped[2]["scored_runs"], [{"name": "different", "progress": 90}])
+
+    def test_leaderboard_does_not_score_replay_or_legacy_scoreless_runs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            replay = root / "replay"
+            replay.mkdir()
+            (replay / "config.json").write_text(json.dumps({"max_actions": 4}))
+            (replay / "score.json").write_text(json.dumps({
+                "metric": "grounded_height_v1", "progress": 70, "elapsed": 10,
+                "timing": "replay", "status": "completed",
+            }))
+            (replay / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 70}))
+            legacy = root / "legacy"
+            legacy.mkdir()
+            (legacy / "config.json").write_text(json.dumps({"max_actions": 4}))
+            runs = [{"name": "replay", "model": "m", "harness": "tau", "status": "completed", "timeout": 10},
+                    {"name": "legacy", "model": "m", "harness": "tau", "status": "completed", "timeout": 10}]
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            self.assertEqual(result["excluded"]["replay"], 1)
+            self.assertTrue(all(row["status"] == "unscored" for row in result["groups"]))
+
+    def test_leaderboard_reads_score_options_and_excludes_failed_archives(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, actions, status, system in [
+                    ("a", 4, "completed", "first"), ("b", 2, "completed", "first"),
+                    ("c", 4, "error", "first"), ("d", 4, "completed", "other")]:
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({"system": system, "max_actions": 1}))
+                (folder / "score.json").write_text(json.dumps({
+                    "metric": "grounded_height_v1", "progress": 2, "elapsed": 20,
+                    "timing": "wall_clock", "status": status,
+                    "options": {"max_actions": actions, "fps": 30},
+                }))
+                (folder / "progress.jsonl").write_text(
+                    '\n'.join(json.dumps(row) for row in [
+                        {"elapsed": 0, "progress": 0}, {"elapsed": 9, "progress": 1},
+                        {"elapsed": 11, "progress": 2}]))
+                runs.append({"name": name, "model": "m", "status": "archived", "timeout": 20})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            self.assertEqual(len(result["groups"]), 2)
+            self.assertEqual(sum(row["scored"] for row in result["groups"]), 3)
+            self.assertTrue(all(row["progress"] == 1 for row in result["groups"]))
+            self.assertEqual({row["settings"]["max_actions"] for row in result["groups"]}, {4, 2})
+
+    def test_leaderboard_excludes_invalid_scores_and_merges_prompt_metadata(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, config, progress, invalid in [
+                    ("verified", {"system_prompt_sent": True}, 10, None),
+                    ("unknown", {}, 20, None),
+                    ("invalid", {"system_prompt_sent": True}, 999, "missing_system_prompt")]:
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps(config))
+                score = {"metric": "grounded_height_v1", "progress": progress,
+                         "elapsed": 10, "timing": "wall_clock", "status": "completed"}
+                if invalid:
+                    score["invalid_reason"] = invalid
+                (folder / "score.json").write_text(json.dumps(score))
+                (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": progress}))
+                runs.append({"name": name, "model": "m", "harness": "tau",
+                             "status": "completed", "timeout": 10})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            self.assertEqual(len(result["groups"]), 1)
+            self.assertEqual(result["groups"][0]["progress"], 15)
+            self.assertEqual(result["groups"][0]["scored"], 2)
+
+    def test_leaderboard_prices_rollouts_and_separates_versions(self):
+        from celestebench import catalog
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, version in (("a", "0.1"), ("b", "0.2")):
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({
+                    "model": "gpt-5.6-sol", "fps": 30, "max_frames": 30,
+                    "max_actions": 4, "benchmark_version": version}))
+                (folder / "score.json").write_text(json.dumps({
+                    "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
+                    "timing": "wall_clock", "status": "completed"}))
+                (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
+                (folder / "messages.jsonl").write_text(json.dumps({
+                    "role": "assistant",
+                    "usage": {"input": 1000, "output": 2000, "cacheRead": 0,
+                              "cacheWrite": 0}}) + "\n")
+                runs.append({"name": name, "model": "gpt-5.6-sol", "harness": "tau",
+                             "status": "completed", "timeout": 10})
+            prices = {"openai": {"models": {"gpt-5.6-sol": {
+                "id": "gpt-5.6-sol", "cost": {"input": 4, "output": 20}}}}}
+            with patch.object(viewer, "RUNS", root), \
+                    patch.object(viewer, "scan_runs", return_value=runs), \
+                    patch.object(catalog, "_models_dev", return_value=prices):
+                result = viewer.leaderboard(10)
+            self.assertEqual(len(result["groups"]), 2)
+            row = next(r for r in result["groups"]
+                       if r["settings"]["benchmark_version"] == "0.1")
+            self.assertEqual(row["producer"], "openai")
+            self.assertEqual(row["producer_name"], "OpenAI")
+            self.assertAlmostEqual(row["cost"], (1000 * 4 + 2000 * 20) / 1_000_000, places=6)
+
+    def test_leaderboard_folds_old_none_into_thinking_off(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, level in (("old", {"reasoning_effort": "none"}),
+                                ("new", {"thinking_level": "off"}),
+                                ("hot", {"reasoning_effort": "high"})):
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({
+                    "fps": 30, "max_actions": 4, "max_frames": 30, **level}))
+                (folder / "score.json").write_text(json.dumps({
+                    "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
+                    "timing": "wall_clock", "status": "completed"}))
+                (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
+                runs.append({"name": name, "model": "model", "harness": "tau",
+                             "status": "completed", "timeout": 10})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            merged = next(row for row in result["groups"]
+                          if row["settings"]["thinking_level"] == "off")
+            self.assertEqual(merged["scored"], 2)
+            self.assertNotIn("reasoning_effort", merged["settings"])
+            hot = next(row for row in result["groups"]
+                       if row["settings"]["thinking_level"] == "high")
+            self.assertEqual(hot["scored"], 1)
+
+    def test_leaderboard_keeps_harnesses_and_setting_generations_apart(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, harness, config, progress in (
+                    ("tau-old", "tau", {"api": "openai-responses", "max_actions": 4}, 40),
+                    ("tau-new", "tau", {"provider": "opencode-go", "max_actions": 4}, 60),
+                    ("codex", "codex", {"max_actions": 4}, 80)):
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({
+                    "thinking_level": "low", "fps": 30, "max_frames": 30, **config}))
+                (folder / "score.json").write_text(json.dumps({
+                    "metric": "grounded_height_v1", "progress": progress, "elapsed": 10,
+                    "timing": "wall_clock", "status": "completed"}))
+                (folder / "progress.jsonl").write_text(
+                    json.dumps({"elapsed": 10, "progress": progress}))
+                runs.append({"name": name, "model": "model", "harness": harness,
+                             "status": "completed", "timeout": 10})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+            self.assertEqual(len(result["groups"]), 3)
+            self.assertEqual({row["settings"]["harness"] for row in result["groups"]},
+                             {"tau", "codex"})
+
 
 class ViewerHTTPTest(unittest.TestCase):
     def setUp(self):
@@ -206,10 +507,28 @@ class ViewerHTTPTest(unittest.TestCase):
         response = self.connection.getresponse()
         return response.status, json.loads(response.read())
 
+    def test_harnesses_endpoint_feeds_the_new_eval_form(self):
+        status, content_type, body = self.get("/api/harnesses")
+        self.assertEqual((status, content_type), (200, "application/json"))
+        catalog = {entry["key"]: entry for entry in json.loads(body)}
+        self.assertTrue(catalog["tau"]["builtin"])
+        self.assertFalse(catalog["codex"]["builtin"])
+        self.assertEqual([field["key"] for field in catalog["codex"]["run"]][:2],
+                         ["model", "thinking_level"])
+        self.assertEqual([field["key"] for field in catalog["codex"]["options"]],
+                         ["prompt", "max_frames", "frames", "fps"])
+
     def test_runs_and_evaluations_have_separate_linkable_pages(self):
-        status, content_type, runs = self.get("/")
+        status, content_type, root = self.get("/")
+        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
+        self.assertIn('id="leaderboard"', root)
+        self.assertIn('id="budget"', root)
+        self.assertIn('href="/runs"', root)
+
+        status, content_type, runs = self.get("/runs")
         self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
         self.assertIn('href="/evals"', runs)
+        self.assertIn('href="/leaderboard"', runs)
         self.assertIn('new URLSearchParams(location.search).get("run")', runs)
         self.assertNotIn('id="evalJobs"', runs)
         self.assertNotIn('"/api/evals"', runs)
@@ -217,15 +536,22 @@ class ViewerHTTPTest(unittest.TestCase):
         status, content_type, evaluations = self.get("/evals")
         self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
         self.assertIn('id="evalJobs"', evaluations)
-        self.assertIn('jsonRequest("/api/evals")', evaluations)
-        self.assertIn('href="/?run=${encodeURIComponent(job.name)}"', evaluations)
+        self.assertIn('jsonRequest("/api/evals", {timeout: 10000})', evaluations)
+        self.assertIn('href="/runs?run=${encodeURIComponent(job.name)}"', evaluations)
         self.assertIn('.filter(job => ["queued", "running"].includes(job.status))', evaluations)
+        self.assertIn('job.run_ready !== false', evaluations)
         self.assertIn('class="eval-live" src="/live/${encodeURIComponent(job.name)}"', evaluations)
         self.assertNotIn("live-audio", evaluations)
 
         status, content_type, css = self.get("/viewer.css")
         self.assertEqual((status, content_type), (200, "text/css; charset=utf-8"))
         self.assertIn(".card", css)
+
+        status, content_type, leaderboard = self.get("/leaderboard")
+        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
+        self.assertIn('id="budget"', leaderboard)
+        self.assertIn('id="leaderboard"', leaderboard)
+        self.assertIn('href="/runs?run=${encodeURIComponent(', leaderboard)
 
     def test_delete_run_removes_files_and_terminal_evaluation_metadata(self):
         with TemporaryDirectory() as tmp:
@@ -275,7 +601,7 @@ class ViewerHTTPTest(unittest.TestCase):
                 viewer.evals._jobs.pop("job", None)
 
     def test_runs_page_confirms_before_deleting_the_selected_run(self):
-        runs = self.get("/")[2]
+        runs = self.get("/runs")[2]
         self.assertIn('id="deleteRun"', runs)
         self.assertIn("confirm(`Delete run", runs)
         self.assertIn('{method:"DELETE"}', runs)
@@ -301,7 +627,7 @@ class ViewerHTTPTest(unittest.TestCase):
 
     def test_launch_stop_and_validation_errors_are_json(self):
         job = {"id": "abc", "name": "model/run", "status": "running"}
-        payload = {"model": "custom-vlm", "api": "openai-completions",
+        payload = {"model": "custom-vlm", "provider": "custom",
                    "base_url": "http://localhost:9000/v1", "timeout": 120}
         with patch.object(viewer.evals, "start_eval", return_value=[job]) as launch:
             self.assertEqual(self.post("/api/evals", payload), (201, [job]))
@@ -311,6 +637,38 @@ class ViewerHTTPTest(unittest.TestCase):
             stop.assert_called_once_with("abc")
         with patch.object(viewer.evals, "start_eval", side_effect=ValueError("Invalid model")):
             self.assertEqual(self.post("/api/evals", {}), (400, {"error": "Invalid model"}))
+
+    def test_video_stays_raw_and_export_endpoint_downloads_the_annotation(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "run"
+            folder.mkdir()
+            (folder / "config.json").write_text(json.dumps({"model": "m"}))
+            (folder / "actions.jsonl").write_text(json.dumps({
+                "decision": 0, "buttons": 2, "frames": 2,
+                "frame_start": 1, "frame_end": 3}) + "\n")
+            with av.open(str(folder / "rollout.mp4"), "w", format="mp4") as out:
+                stream = out.add_stream("libx264", rate=30)
+                stream.width = stream.height = 512
+                stream.pix_fmt = "yuv420p"
+                for _ in range(3):
+                    out.mux(stream.encode(av.VideoFrame.from_ndarray(
+                        np.zeros((512, 512, 3), np.uint8), format="rgb24")))
+                out.mux(stream.encode())
+            with patch.object(viewer, "RUNS", root), patch.object(export, "RUNS", root):
+                status, content_type, body = self.get_bytes("/video/run/rollout.mp4")
+                self.assertEqual((status, content_type), (200, "video/mp4"))
+                self.assertEqual(body, (folder / "rollout.mp4").read_bytes())
+                self.assertFalse((folder / "export.mp4").is_file())
+                self.connection.request("GET", "/export/run")
+                response = self.connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "video/mp4")
+                self.assertEqual(response.getheader("Content-Disposition"),
+                                 'attachment; filename="run.mp4"')
+            self.assertTrue((folder / "export.mp4").is_file())
+            self.assertEqual(body, (folder / "export.mp4").read_bytes())
 
     def test_cross_origin_and_non_json_requests_cannot_launch(self):
         with patch.object(viewer.evals, "start_eval") as launch:
