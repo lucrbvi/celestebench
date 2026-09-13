@@ -3,11 +3,14 @@
 Each harness declares its launcher and the settings it accepts, so the viewer
 renders the new-eval form and the backend validates a payload from the same
 table. The built-in Tau harness is marked `builtin`: it owns its provider and
-API-key handling. External harnesses (Codex today) are plain commands billed
-through their own CLI; adding one is a new entry here plus its own script.
+API-key handling. External harnesses (Codex, OpenCode and Pi) are plain commands
+billed through their own CLI; adding one is a new entry here plus its own script
+under examples/.
 """
 
 from dataclasses import asdict, dataclass
+
+from .harness import PROMPT
 
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -88,8 +91,8 @@ HARNESSES: dict[str, Harness] = {
         trace="codex.jsonl",
         requires="codex",
         note="Runs the host Codex CLI in an empty read-only workspace with shell "
-             "network off. Uses CODEX_API_KEY when set (parallel); otherwise your "
-             "`codex login` ChatGPT session, one run at a time.",
+             "network off. Authenticates with CODEX_API_KEY when set, otherwise the "
+             "host `codex login` ChatGPT session, which parallel runs share.",
         run=(
             Field("model", "model", required=True),
             Field("thinking_level", "reasoning", "choice", "low", choices=THINKING_LEVELS,
@@ -98,10 +101,72 @@ HARNESSES: dict[str, Harness] = {
                   help="wall-clock budget for this run (seconds)"),
         ),
         options=(
-            Field("prompt", "task prompt", "textarea", required=True,
-                  help="Sent to the Codex CLI working against our MCP game server"),
+            Field("prompt", "task prompt", "textarea", PROMPT,
+                  help="Message sent to the CLI; the game rules ride in the system prompt"),
             Field("max_frames", "max frames / action", "int", 30,
                   help="Maximum frames one action holds a button"),
+            Field("frames", "frame cap", "int", None, advanced=True,
+                  help="Cap on the total number of environment frames played"),
+            Field("fps", "FPS", "number", 30, advanced=True,
+                  help="Run the game in real time at this speed; empty pauses the game"),
+        ),
+    ),
+    "opencode": Harness(
+        key="opencode",
+        label="OpenCode CLI",
+        script="examples/opencode.py",
+        nested=True,
+        trace="opencode.jsonl",
+        requires="opencode",
+        note="Runs the host OpenCode CLI in an empty workspace with every built-in "
+             "tool denied, so it can only play through our MCP game server. Uses the "
+             "host `opencode auth login` session.",
+        run=(
+            Field("model", "model", required=True,
+                  help="OpenCode provider/model, e.g. opencode-go/deepseek-v4.1-flash"),
+            Field("thinking_level", "reasoning", "choice", "low", choices=THINKING_LEVELS,
+                  help="Passed to OpenCode as the model variant; off sends no variant"),
+            Field("timeout", "timeout (s)", "number", 120,
+                  help="wall-clock budget for this run (seconds)"),
+        ),
+        options=(
+            Field("prompt", "kickoff prompt", "textarea", PROMPT,
+                  help="Message sent to the CLI; the game rules ride in the agent's system prompt"),
+            Field("max_frames", "max frames / action", "int", 30,
+                  help="Maximum frames one action holds a button"),
+            Field("max_images", "max images / decision", "int", 3, advanced=True,
+                  help="Frames sampled into each observation"),
+            Field("frames", "frame cap", "int", None, advanced=True,
+                  help="Cap on the total number of environment frames played"),
+            Field("fps", "FPS", "number", 30, advanced=True,
+                  help="Run the game in real time at this speed; empty pauses the game"),
+        ),
+    ),
+    "pi": Harness(
+        key="pi",
+        label="Pi CLI",
+        script="examples/pi.py",
+        nested=True,
+        trace="pi.jsonl",
+        requires="pi",
+        concurrency=1,
+        note="Runs the host Pi CLI in an empty workspace with built-in tools off, "
+             "loading our bundled extension that bridges to the MCP game server. "
+             "Uses the host Pi login; runs queue because they share it.",
+        run=(
+            Field("model", "model", required=True,
+                  help="Pi model id, e.g. openai-codex/gpt-5.6-sol; bare ids use Pi's default provider"),
+            Field("thinking_level", "thinking", "choice", "low", choices=THINKING_LEVELS),
+            Field("timeout", "timeout (s)", "number", 120,
+                  help="wall-clock budget for this run (seconds)"),
+        ),
+        options=(
+            Field("prompt", "kickoff prompt", "textarea", PROMPT,
+                  help="Message sent to the CLI; the game rules ride in the system prompt"),
+            Field("max_frames", "max frames / action", "int", 30,
+                  help="Maximum frames one action holds a button"),
+            Field("max_images", "max images / decision", "int", 3, advanced=True,
+                  help="Frames sampled into each observation"),
             Field("frames", "frame cap", "int", None, advanced=True,
                   help="Cap on the total number of environment frames played"),
             Field("fps", "FPS", "number", 30, advanced=True,

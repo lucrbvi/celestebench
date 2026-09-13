@@ -46,7 +46,11 @@ def _harness(name):
     return HARNESSES.get(name) or HARNESSES["tau"]
 
 
-_REQUIREMENTS = {"codex": lambda: shutil.which("codex") is not None}
+_REQUIREMENTS = {
+    "codex": lambda: shutil.which("codex") is not None,
+    "opencode": lambda: shutil.which("opencode") is not None,
+    "pi": lambda: shutil.which("pi") is not None,
+}
 
 
 def _require(harness):
@@ -229,14 +233,6 @@ def _launch(job, options, secret):
     threading.Thread(target=_watch, args=(job, proc, secret), daemon=True).start()
 
 
-def _concurrency(harness):
-    """Codex shares one ChatGPT login without an API key, so it runs one at a time
-    there and in parallel once CODEX_API_KEY lets every run authenticate on its own."""
-    if harness.key == "codex" and not os.environ.get("CODEX_API_KEY"):
-        return 1
-    return harness.concurrency
-
-
 def _pump():
     """Start queued evaluations in submission order, up to each harness's cap."""
     with _lock:
@@ -249,8 +245,7 @@ def _pump():
                 continue
             harness = _harness(job.get("harness"))
             # Capped harnesses share a resource; wait for a free slot.
-            limit = _concurrency(harness)
-            if limit and busy.get(harness.key, 0) >= limit:
+            if harness.concurrency and busy.get(harness.key, 0) >= harness.concurrency:
                 continue
             options, secret = job.pop("_options", None), job.pop("_secret", None)
             if options is None:
@@ -350,7 +345,7 @@ def _enqueue(runs, harness, plans):
                    "_folder": str(folder), "_meta": str(meta)}
             # Options and the secret stay in memory only; never persisted to disk.
             # Capped harnesses queue once their share of the resource is running.
-            limit = _concurrency(HARNESSES[harness])
+            limit = HARNESSES[harness].concurrency
             running = sum(1 for _id in _processes
                           if _harness(_jobs[_id].get("harness")).key == harness)
             if limit and running >= limit:

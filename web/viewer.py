@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 import av
 
 from celestebench import catalog, cost
+from celestebench.harnesses import HARNESSES
 
 from . import evals
 
@@ -75,7 +76,7 @@ def _video_info(path: Path) -> tuple[float | None, float | None]:
 
 
 def apply_nested(folder: Path) -> Path:
-    """External harnesses (Codex) nest the rollout engine one level deeper."""
+    """External agent harnesses nest the rollout engine one level deeper."""
     return folder / "rollout" if (folder / "rollout").is_dir() else folder
 
 
@@ -117,7 +118,8 @@ def scan_runs() -> list[dict]:
         if path.is_file() and path.name in {"config.json", "messages.jsonl", "actions.jsonl", "decisions.jsonl", "rollout.mp4"}:
             folders.add(path.parent)
     for name, job in jobs.items():
-        if job.get("harness") == "codex":
+        nested = HARNESSES.get(job.get("harness"))
+        if nested and nested.nested:
             folders.discard(RUNS / name / "rollout")  # merged into its wrapper row
     runs = []
     for folder in sorted(folders):
@@ -246,9 +248,9 @@ def leaderboard(budget: float | None = None) -> dict:
     groups = {}
     for item in candidates:
         run, score = item["run"], item["score"]
-        key = (run.get("model", "?"), json.dumps(item["settings"], sort_keys=True,
-                                                   separators=(",", ":")))
-        group = groups.setdefault(key, {"model": run.get("model", "?"),
+        model = catalog.display_model(run.get("model", "?"))
+        key = (model, json.dumps(item["settings"], sort_keys=True, separators=(",", ":")))
+        group = groups.setdefault(key, {"model": model,
                                         "settings": item["settings"], "scores": [],
                                         "scored_runs": [], "costs": [], "runs": 0, "unscored": 0})
         group["runs"] += 1
@@ -264,7 +266,7 @@ def leaderboard(budget: float | None = None) -> dict:
         else:
             group["scores"].append(value)
             group["scored_runs"].append({"name": run["name"], "progress": value})
-            priced = cost.rollout_cost(item["usage"], run.get("model", "?"), codex=item["codex"])
+            priced = cost.rollout_cost(item["usage"], model, codex=item["codex"])
             if priced is not None:
                 group["costs"].append(priced)
     rows = []

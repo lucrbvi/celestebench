@@ -96,6 +96,48 @@ class ViewerTest(unittest.TestCase):
             self.assertEqual(decisions[1]["thinking"], "plan two")
             self.assertEqual(decisions[1]["tool"], {"actions": [{"buttons": 2, "frames": 1}]})
 
+    def test_normalized_external_run_reads_messages_and_hides_the_nested_rollout(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "deepseek" / "run"
+            rollout = wrapper / "rollout"
+            rollout.mkdir(parents=True)
+            (wrapper / "config.json").write_text(json.dumps({"model": "deepseek"}))
+            (rollout / "config.json").write_text(json.dumps({"model": "deepseek", "fps": 30}))
+            (rollout / "decisions.jsonl").write_text('\n'.join(json.dumps({
+                "decision": index, "status": "played", "frame_start": start, "frame_end": end,
+            }) for index, (start, end) in enumerate([(1, 30), (30, 90)])) + "\n")
+            (rollout / "actions.jsonl").write_text('\n'.join(json.dumps({
+                "decision": index, "buttons": 1, "frames": 3, "frame_start": start,
+                "frame_end": start + 3}) for index, start in enumerate([1, 30])) + "\n")
+            # What examples/opencode.py and examples/pi.py write for the viewer.
+            (rollout / "messages.jsonl").write_text('\n'.join(json.dumps(row) for row in [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "plan one"},
+                    {"type": "toolCall", "arguments": {"actions": [{"buttons": 1, "frames": 3}]}}],
+                 "usage": {"input": 10, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 12}},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "again"},
+                    {"type": "toolCall", "arguments": {"actions": [{"buttons": 2, "frames": 3}]}}],
+                 "usage": {"input": 12, "output": 2, "cacheRead": 0, "cacheWrite": 0,
+                           "totalTokens": 14}},
+            ]) + "\n")
+            (root / ".evals").mkdir()
+            (root / ".evals" / "job.json").write_text(json.dumps({
+                "id": "job", "name": "deepseek/run", "model": "deepseek", "harness": "opencode",
+                "provider": None, "status": "completed", "error": None, "decisions": 2,
+                "timeout": 120, "frames": 90, "elapsed": 120, "tokens": 26, "started_at": 1.0}))
+            with patch.object(viewer, "RUNS", root):
+                runs = viewer.scan_runs()
+                decisions = viewer.load_decisions("deepseek/run")["decisions"]
+            self.assertEqual([run["name"] for run in runs], ["deepseek/run"])
+            self.assertEqual(runs[0]["harness"], "opencode")
+            self.assertEqual(len(decisions), 2)
+            self.assertEqual(decisions[0]["thinking"], "plan one")
+            self.assertEqual(decisions[0]["tool"], {"actions": [{"buttons": 1, "frames": 3}]})
+            self.assertEqual(decisions[1]["text"], "again")
+
     def test_legacy_actions_are_approximate_and_start_after_observation_frame(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -458,6 +500,31 @@ class ViewerTest(unittest.TestCase):
             self.assertEqual(len(result["groups"]), 3)
             self.assertEqual({row["settings"]["harness"] for row in result["groups"]},
                              {"tau", "codex"})
+
+
+    def test_leaderboard_folds_model_aliases_and_gateway_prefixes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = []
+            for name, model, harness in (
+                    ("tau", "deepseek-flash", "tau"),
+                    ("opencode", "opencode-go/deepseek-v4.1-flash", "opencode"),
+                    ("vision", "deepseek-v4-flash-vision-exp", "tau")):
+                folder = root / name
+                folder.mkdir()
+                (folder / "config.json").write_text(json.dumps({"thinking_level": "low", "fps": 30}))
+                (folder / "score.json").write_text(json.dumps({
+                    "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
+                    "timing": "wall_clock", "status": "completed"}))
+                (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
+                runs.append({"name": name, "model": model, "harness": harness,
+                             "status": "completed", "timeout": 10})
+            with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+                result = viewer.leaderboard(10)
+        pairs = {(row["model"], row["settings"]["harness"]) for row in result["groups"]}
+        self.assertEqual(pairs, {("deepseek-v4.1-flash", "tau"),
+                                 ("deepseek-v4.1-flash", "opencode"),
+                                 ("deepseek-v4-flash-vision-exp", "tau")})
 
 
 class ViewerHTTPTest(unittest.TestCase):

@@ -3,18 +3,12 @@
 import argparse
 import json
 import os
-import resource
 import secrets
-import socket
 import subprocess
-import sys
 import tempfile
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
-from celestebench import BENCHMARK_VERSION
+from celestebench import harness
 from celestebench.prompt import system_prompt
 
 # Codex keeps a read-only view of its empty workspace root and nothing else:
@@ -24,6 +18,9 @@ from celestebench.prompt import system_prompt
 PERMISSIONS = """\
 approval_policy = "never"
 default_permissions = "celestebench"
+# Force file auth so parallel runs share `auth.json` instead of each talking to
+# the OS keyring, whose per-CODEX_HOME key would strand every refreshed token.
+cli_auth_credentials_store = "file"
 
 [permissions.celestebench]
 extends = ":read-only"
@@ -38,67 +35,15 @@ enabled = false
 """
 
 
-def free_port():
-    """Bind and release a loopback port so parallel runs never share one."""
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
-def wait_for_mcp(process, token, port, timeout=20):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/mcp",
-        data=b"{}",
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-    deadline = time.monotonic() + timeout
-    while process.poll() is None and time.monotonic() < deadline:
-        try:
-            urllib.request.urlopen(request, timeout=0.2).close()
-            return
-        except urllib.error.HTTPError as error:
-            if error.code in (400, 406):
-                return
-        except (OSError, urllib.error.URLError):
-            pass
-        time.sleep(0.1)
-    raise RuntimeError("this run's host MCP server did not become ready")
-
-
-def stop_process(process):
-    if process is None or process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+free_port = harness.free_port
+wait_for_mcp = harness.wait_for_mcp
+stop_process = harness.stop_process
+limit_output = harness.limit_output
 
 
 def _stop_mcp(process, rollout, timeout=0, grace=60):
-    """Let a still-running episode reach its own deadline and finish recording: a
-    termination mid-finalization writes an mp4 without its moov index. The MCP
-    server owns the wall-clock budget, so the game keeps running until it times
-    out even after the model ends its turn."""
-    if process is not None and process.poll() is None:
-        done = rollout / "live.done"
-        # A run that never called a tool has no episode to let finish.
-        wait = timeout + grace if (rollout / "config.json").is_file() else 0
-        deadline = time.monotonic() + wait
-        while time.monotonic() < deadline and process.poll() is None and not done.is_file():
-            time.sleep(0.25)
-        if done.is_file():
-            time.sleep(1)  # the recorder closes its container shortly after
-    stop_process(process)
-
-
-def limit_output():
-    resource.setrlimit(resource.RLIMIT_FSIZE, (67108864, 67108864))
+    # `stop` stays a codex module attribute so tests can patch it.
+    harness.stop_mcp(process, rollout, timeout, grace, stop=stop_process)
 
 
 # Codex reasoning efforts, weakest to strongest. Tau's "off" and "minimal" have
@@ -152,49 +97,24 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     if api_key is None and not login.is_file():
         raise SystemExit("Set CODEX_API_KEY or run `codex login` before launching Codex")
     token, port = secrets.token_urlsafe(32), free_port()
-    output.mkdir(parents=True, exist_ok=False)
-    rollout, workspace = output / "rollout", output / "workspace"
-    workspace.mkdir()
-    config = {
-        "model": model,
-        "benchmark_version": BENCHMARK_VERSION,
-        "timeout": timeout,
-        "frames": frames,
-        "max_frames": max_frames,
-        "fps": fps,
-        "thinking_level": thinking_level,
-    }
-    (output / "config.json").write_text(
-        json.dumps(config, indent=2) + "\n", encoding="utf-8"
+    rollout = harness.prepare(
+        output,
+        harness.run_config(model, timeout, frames, max_frames, fps, thinking_level),
+        prompt,
     )
-    (output / "prompt.txt").write_text(prompt, encoding="utf-8")
-    mcp_args = [
-        sys.executable,
-        "-m",
-        "celestebench.mcp",
-        "--transport",
-        "http",
-        "--output",
-        str(rollout),
-        "--port",
-        str(port),
-        "--timeout",
-        str(timeout),
-        "--max-frames",
-        str(max_frames),
-    ]
-    if frames is not None:
-        mcp_args += ["--frames", str(frames)]
-    if fps is None:
-        mcp_args.append("--lite")  # empty frame rate pauses the game
-    else:
-        mcp_args += ["--fps", str(fps)]
+    workspace = output / "workspace"
+    workspace.mkdir()
+    mcp_args = harness.mcp_command(
+        rollout, port=port, timeout=timeout, frames=frames, max_frames=max_frames, fps=fps)
     env = os.environ.copy()
     env.pop("CODEX_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
     env["CELESTEBENCH_MCP_TOKEN"] = token
     # A throwaway CODEX_HOME carries our sandbox profile; auth is either the
-    # key we inject or a symlink to the host's `codex login` session.
+    # key we inject or a symlink to the host's `codex login` session. Parallel
+    # runs all write through that one file, which is how Codex settles a shared
+    # token refresh: the first refresher persists the new bundle and the others
+    # reload it instead of asking the token authority again.
     with tempfile.TemporaryDirectory(prefix="celestebench-codex-") as tmp:
         home = Path(tmp)
         (home / "config.toml").write_text(PERMISSIONS, encoding="utf-8")
@@ -266,7 +186,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt", default=harness.PROMPT)
     parser.add_argument("--model")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=300)

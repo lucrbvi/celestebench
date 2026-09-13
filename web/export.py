@@ -73,7 +73,7 @@ def _buttons(folder, total):
 
 
 def _model(name, folder):
-    """Prefer the wrapper config: Codex runs keep the model above rollout/."""
+    """Prefer the wrapper config: external harnesses keep the model above rollout/."""
     for path in (folder / "config.json", RUNS / name / "config.json"):
         try:
             config = json.loads(path.read_text(encoding="utf-8"))

@@ -2,9 +2,9 @@
 
 Mode (Lite vs RTC) is the only real variant, plus a marker line when the
 client plays through the MCP server. Tau re-prompts the model after every
-play call, so it must ask for exactly one call; one-shot clients (Codex)
-never re-prompt, so they must ask the model to keep calling play itself.
-Edit the text below once.
+play call, so it must ask for exactly one call; one-shot clients (Codex,
+OpenCode, Pi) never re-prompt, so they must ask the model to keep calling play
+itself. Edit the text below once.
 """
 
 def system_prompt(*, fps=None, max_frames=30, max_images=3, mcp=False, oneshot=False) -> str:

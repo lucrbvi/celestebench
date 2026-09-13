@@ -22,9 +22,14 @@ Open the page in your browser of choice and click on `evaluations` on the top-ri
 
 Click on `new eval`.
 
-If you want to _run a model on API_: select "CelesteBench Harness"
+Pick a harness in the harness box:
 
-If you want to _run a model inside Codex_: select "Codex CLI" in the harness box
+- **CelesteBench Harness** (`tau`): run a model on API.
+- **Codex CLI**: run a model inside a jailed Codex CLI, using your `codex login` session or `CODEX_API_KEY`.
+- **OpenCode CLI**: run a model inside OpenCode, using your `opencode auth login` session.
+- **Pi CLI**: run a model inside Pi, which loads our bundled MCP extension; uses your Pi login and queues runs because they share it.
+
+External harnesses need their CLI on `PATH` (`codex`, `opencode`, `pi`). Each one plays in an empty workspace where its built-in tools are denied, so the only tool available is the game through our MCP server. The game rules ride in the system prompt and every external harness sends the same one-line task prompt, `Play Celeste Classic.`. Their traces are normalized into the same `messages.jsonl` the viewer already reads.
 
 ### Step 4.
 

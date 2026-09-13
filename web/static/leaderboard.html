@@ -45,8 +45,23 @@ const color = g => {
 const HARNESS = {
   tau: { name: "CelesteBench", dash: null, shape: "circle", color: "hsl(210 80% 62%)" },
   codex: { name: "Codex", dash: "6 3", shape: "square", color: "hsl(285 70% 70%)" },
+  opencode: { name: "OpenCode", dash: "2 4", shape: "triangle", color: "hsl(35 85% 60%)" },
+  pi: { name: "Pi", dash: "8 2 2 2", shape: "diamond", color: "hsl(150 55% 55%)" },
 };
 const harness = key => HARNESS[key] || { name: key, dash: "1 3", shape: "diamond", color: "hsl(0 0% 65%)" };
+const SHAPE_CSS = {
+  circle: "border-radius:50%", square: "border-radius:0",
+  triangle: "clip-path:polygon(50% 0,100% 100%,0 100%)",
+  diamond: "clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%)",
+};
+const swatchStyle = shape => SHAPE_CSS[shape] || SHAPE_CSS.circle;
+function marker(shape, x, y, color, i) {
+  const attrs = `fill="${color}" class="chart-point" data-i="${i}"`;
+  if (shape === "square") return `<rect x="${x - 3.5}" y="${y - 3.5}" width="7" height="7" ${attrs}/>`;
+  if (shape === "triangle") return `<polygon points="${x},${y - 4.5} ${x + 4.2},${y + 3.2} ${x - 4.2},${y + 3.2}" ${attrs}/>`;
+  if (shape === "diamond") return `<polygon points="${x},${y - 4.5} ${x + 4.5},${y} ${x},${y + 4.5} ${x - 4.5},${y}" ${attrs}/>`;
+  return `<circle cx="${x}" cy="${y}" r="4" ${attrs}/>`;
+}
 const harnessKey = row => (row.settings || {}).harness || "tau";
 const harnessName = row => harness(harnessKey(row)).name;
 const usd = v => "$" + (v >= 0.01 ? v.toFixed(3) : v.toPrecision(3));
@@ -54,8 +69,8 @@ const level = s => s.thinking_level || s.reasoning_effort || "—";
 const RANK = {off: 0, none: 0, minimal: 1, light: 2, low: 2, medium: 3, high: 4, xhigh: 5, max: 6};
 const rank = s => RANK[String(s.thinking_level || s.reasoning_effort || "").toLowerCase()] ?? 3.5;
 const shortModel = m => String(m).replace(/^.*\//, "").replace(/-contributor$/, "");
-const readSaved = () => { try { return JSON.parse(localStorage.celestebenchModels || "null"); } catch { return null; } };
-const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celestebenchHarnesses || "null"); } catch { return null; } };
+const readSaved = () => { try { return JSON.parse(localStorage.celestebenchHiddenModels || "null"); } catch { return null; } };
+const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celestebenchHiddenHarnesses || "null"); } catch { return null; } };
 let plottable = [], selectedModels = new Set(), selectedHarnesses = new Set(), scoredRows = [], chartPoints = [];
 
 function logoHtml(row) {
@@ -66,6 +81,12 @@ function logoHtml(row) {
 }
 const models = () => [...new Set(plottable.map(g => g.model))];
 const harnesses = () => [...new Set([...plottable, ...scoredRows].map(harnessKey))];
+// Persist what the user hid, not what they kept, so newly recorded models and
+// harnesses show up by default instead of staying filtered out.
+function saveHidden() {
+  localStorage.celestebenchHiddenModels = JSON.stringify(models().filter(m => !selectedModels.has(m)));
+  localStorage.celestebenchHiddenHarnesses = JSON.stringify(harnesses().filter(h => !selectedHarnesses.has(h)));
+}
 function renderSummary() {
   $("selectorToggle").textContent = `${selectedModels.size} of ${models().length} models`;
   $("harnessToggle").textContent = `${selectedHarnesses.size} of ${harnesses().length} harnesses`;
@@ -74,7 +95,7 @@ function renderSummary() {
 function setModels(on) {
   selectedModels = on ? new Set(models()) : new Set();
   $("selectorList").querySelectorAll("input").forEach(b => b.checked = on);
-  localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+  saveHidden();
   renderSummary();
   renderChart();
 }
@@ -82,7 +103,7 @@ function setModels(on) {
 function setHarnesses(on) {
   selectedHarnesses = on ? new Set(harnesses()) : new Set();
   $("harnessList").querySelectorAll("input").forEach(b => b.checked = on);
-  localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+  saveHidden();
   renderSummary();
   renderChart();
   renderTable();
@@ -99,7 +120,7 @@ function buildSelector(groups) {
   }).join("");
   $("selectorList").querySelectorAll("input").forEach(box => box.onchange = () => {
     box.checked ? selectedModels.add(box.dataset.model) : selectedModels.delete(box.dataset.model);
-    localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+    saveHidden();
     renderSummary();
     renderChart();
   });
@@ -109,14 +130,12 @@ function buildSelector(groups) {
     if (seenHarnesses.has(key)) return "";
     seenHarnesses.add(key);
     const style = harness(key);
-    const swatch = style.shape === "square"
-      ? `<span class="swatch" style="--c:${style.color};border-radius:0"></span>`
-      : `<span class="swatch" style="--c:${style.color};border-radius:50%"></span>`;
+    const swatch = `<span class="swatch" style="--c:${style.color};${swatchStyle(style.shape)}"></span>`;
     return `<label class="selector-row"><input type="checkbox" data-harness="${esc(key)}"${selectedHarnesses.has(key) ? " checked" : ""}>${swatch}<span class="selector-name">${esc(style.name)}</span></label>`;
   }).join("");
   $("harnessList").querySelectorAll("input").forEach(box => box.onchange = () => {
     box.checked ? selectedHarnesses.add(box.dataset.harness) : selectedHarnesses.delete(box.dataset.harness);
-    localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+    saveHidden();
     renderSummary();
     renderChart();
     renderTable();
@@ -166,9 +185,7 @@ function renderChart() {
       const dash = style.dash ? ` stroke-dasharray="${style.dash}"` : "";
       if (rows.length > 1) s += `<polyline points="${rows.map(q => `${X(q.cost)},${Y(q.progress)}`).join(" ")}" fill="none" stroke="${color(p)}" stroke-width="1.5" opacity=".75"${dash}/>`;
     }
-    s += style.shape === "square"
-      ? `<rect x="${X(p.cost) - 3.5}" y="${Y(p.progress) - 3.5}" width="7" height="7" fill="${color(p)}" class="chart-point" data-i="${i}"/>`
-      : `<circle cx="${X(p.cost)}" cy="${Y(p.progress)}" r="4" fill="${color(p)}" class="chart-point" data-i="${i}"/>`;
+    s += marker(style.shape, X(p.cost), Y(p.progress), color(p), i);
   });
 
   const labels = [];
@@ -263,18 +280,14 @@ async function load() {
   plottable = all.filter(row => row.status === "scored" && row.cost > 0 && Number.isFinite(row.progress));
 
   const available = models();
-  const saved = readSaved();
-  selectedModels = Array.isArray(saved)
-    ? new Set(available.filter(m => saved.includes(m)))
-    : new Set(available);
-  localStorage.celestebenchModels = JSON.stringify([...selectedModels]);
+  const hidden = readSaved();
+  selectedModels = new Set(available.filter(m => !Array.isArray(hidden) || !hidden.includes(m)));
 
   const availableHarnesses = harnesses();
-  const savedHarnesses = readSavedHarnesses();
-  selectedHarnesses = Array.isArray(savedHarnesses)
-    ? new Set(availableHarnesses.filter(h => savedHarnesses.includes(h)))
-    : new Set(availableHarnesses);
-  localStorage.celestebenchHarnesses = JSON.stringify([...selectedHarnesses]);
+  const hiddenHarnesses = readSavedHarnesses();
+  selectedHarnesses = new Set(availableHarnesses.filter(
+    h => !Array.isArray(hiddenHarnesses) || !hiddenHarnesses.includes(h)));
+  saveHidden();
 
   $("leaderboardControls").hidden = !available.length;
   buildSelector(all);

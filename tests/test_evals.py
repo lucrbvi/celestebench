@@ -193,7 +193,7 @@ class EvalTests(unittest.TestCase):
                 evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             jobs = evals.start_eval({"harness": "codex", "models": ["a", "b", "c", "d", "e"],
-                                     "prompt": "x", "timeout": 5}, Path(directory))
+                                     "timeout": 5}, Path(directory))
             stopped = evals.stop_eval(jobs[4]["id"])
             self.assertEqual(stopped["status"], "cancelled")
             gate.set()
@@ -301,7 +301,7 @@ class EvalTests(unittest.TestCase):
             self.assertLess(job["elapsed"], 30, "boot time must stay out of the game clock")
             self.assertEqual(job["frames"], 3)
 
-    def test_codex_jobs_launch_without_a_cap(self):
+    def test_codex_jobs_run_in_parallel_on_a_shared_login(self):
         gate = threading.Event()
 
         class Blocking(FakeProcess):
@@ -314,9 +314,8 @@ class EvalTests(unittest.TestCase):
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
                 patch.dict(evals.os.environ, {"CODEX_API_KEY": ""}):
             jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"],
-                                     "prompt": "x", "timeout": 5}, Path(directory))
-            self.assertEqual([job["status"] for job in jobs],
-                             ["running", "queued", "queued", "queued", "queued"])
+                                     "timeout": 5}, Path(directory))
+            self.assertEqual([job["status"] for job in jobs], ["running"] * 5)
             gate.set()
             self.wait_until(lambda: all(evals._jobs[job["id"]]["status"] != "running"
                                         for job in jobs))
@@ -334,13 +333,13 @@ class EvalTests(unittest.TestCase):
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
                 patch.dict(evals.os.environ, {"CODEX_API_KEY": "k"}):
             jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"],
-                                     "prompt": "x", "timeout": 5}, Path(directory))
+                                     "timeout": 5}, Path(directory))
             self.assertEqual([job["status"] for job in jobs], ["running"] * 5)
             gate.set()
             self.wait_until(lambda: all(evals._jobs[job["id"]]["status"] != "running"
                                         for job in jobs))
 
-    def test_codex_harness_launches_the_local_cli_with_prompt_and_budgets(self):
+    def test_codex_harness_launches_the_local_cli_with_budgets(self):
         processes = []
 
         def launch(args, **kwargs):
@@ -351,13 +350,13 @@ class EvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
             jobs = evals.start_eval({"harness": "codex", "model": "gpt-5.2", "frames": 9,
-                                     "prompt": "Play the game.", "timeout": 30}, Path(directory))
+                                     "timeout": 30}, Path(directory))
             job = jobs[0]
             self.assertEqual(job["harness"], "codex")
             args = processes[0].args
             self.assertIn(str(evals.ROOT / evals.HARNESSES["codex"].script), args)
             self.assertIn("--model=gpt-5.2", args)
-            self.assertIn("--prompt=Play the game.", args)
+            self.assertIn("--prompt=Play Celeste Classic.", args)
             self.assertIn("--timeout=30", args)
             self.assertIn("--frames=9", args)
             self.wait_until(lambda: evals._jobs[jobs[0]["id"]]["status"] != "running")
@@ -375,14 +374,14 @@ class EvalTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
-            jobs = evals.start_eval({"harness": "codex", "prompt": "x", "max_frames": 5, "evals": [
+            jobs = evals.start_eval({"harness": "codex", "max_frames": 5, "evals": [
                 {"model": "gpt-5.2", "thinking_level": "high", "timeout": 45},
             ]}, Path(directory))
             args = processes[0].args
             self.assertIn("--thinking-level=high", args)
             self.assertIn("--timeout=45", args)
             self.assertIn("--max-frames=5", args)
-            self.assertIn("--prompt=x", args)
+            self.assertIn("--prompt=Play Celeste Classic.", args)
             self.wait_until(lambda: evals._jobs[jobs[0]["id"]]["status"] == "completed")
             time.sleep(0.1)
 
@@ -402,13 +401,54 @@ class EvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(evals.subprocess, "Popen") as launch, \
                 patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
-            for bad in ({"harness": "codex", "model": "m"},
-                        {"prompt": "x"},
-                        {"harness": "codex", "model": "m", "prompt": "x", "api": "anthropic"},
-                        {"harness": "codex", "models": ["m"], "prompt": "x", "frames": 0},
-                        {"harness": "codex", "model": "m@openai", "prompt": "x"}):
+            for bad in ({"prompt": "x"},
+                        {"harness": "codex"},
+                        {"harness": "codex", "model": "m", "api": "anthropic"},
+                        {"harness": "codex", "models": ["m"], "frames": 0},
+                        {"harness": "codex", "model": "m@openai"}):
                 with self.assertRaises(ValueError):
                     evals.start_eval(bad, Path(directory))
+            launch.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_external_harnesses_catalog_and_launch(self):
+        catalog = {entry["key"]: entry for entry in evals.harness_catalog()}
+        for key in ("opencode", "pi"):
+            self.assertFalse(catalog[key]["builtin"])
+            self.assertEqual([field["key"] for field in catalog[key]["run"]],
+                             ["model", "thinking_level", "timeout"])
+            self.assertEqual([field["key"] for field in catalog[key]["options"]],
+                             ["prompt", "max_frames", "max_images", "frames", "fps"])
+        processes = []
+
+        def launch(args, **kwargs):
+            process = FakeProcess(args, **kwargs)
+            processes.append(process)
+            return process
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(evals.subprocess, "Popen", launch), \
+                patch.object(evals.shutil, "which", return_value="/usr/bin/opencode"):
+            evals.start_eval({"harness": "opencode", "model": "opencode-go/deepseek",
+                              "max_frames": 5, "timeout": 10}, Path(directory))
+            args = processes[0].args
+            self.assertIn(str(evals.ROOT / evals.HARNESSES["opencode"].script), args)
+            self.assertIn("--model=opencode-go/deepseek", args)
+            self.assertIn("--prompt=Play Celeste Classic.", args)
+            self.assertIn("--max-frames=5", args)
+            self.assertIn("--max-images=3", args)
+            self.assertIn("--thinking-level=low", args)
+            self.assertIn("--timeout=10", args)
+            self.wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
+            time.sleep(0.1)
+
+    def test_pi_harness_requires_pi_before_touching_the_filesystem(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(evals.subprocess, "Popen") as launch, \
+                patch.object(evals.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "pi"):
+                evals.start_eval({"harness": "pi", "model": "openai-codex/gpt-5.6-sol"},
+                                 Path(directory))
             launch.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
 
@@ -417,7 +457,7 @@ class EvalTests(unittest.TestCase):
                 patch.object(evals.subprocess, "Popen") as launch, \
                 patch.object(evals.shutil, "which", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "codex"):
-                evals.start_eval({"harness": "codex", "model": "m", "prompt": "x"}, Path(directory))
+                evals.start_eval({"harness": "codex", "model": "m"}, Path(directory))
             launch.assert_not_called()
             self.assertEqual(list(Path(directory).iterdir()), [])
 

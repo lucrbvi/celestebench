@@ -20,6 +20,9 @@ class CodexTest(unittest.TestCase):
         self.assertIn('":workspace_roots" = "read"', codex.PERMISSIONS)
         self.assertIn("enabled = false", codex.PERMISSIONS)
 
+    def test_profile_shares_one_file_auth_across_parallel_runs(self):
+        self.assertIn('cli_auth_credentials_store = "file"', codex.PERMISSIONS)
+
     def test_reasoning_effort_maps_tau_thinking_levels(self):
         self.assertIsNone(codex.reasoning_effort(None))
         self.assertIsNone(codex.reasoning_effort(""))
@@ -138,33 +141,13 @@ class CodexTest(unittest.TestCase):
         stop.assert_called_once_with(process, Path(root) / "out" / "rollout", 2)
 
     @patch.object(codex, "stop_process")
-    def test_stop_mcp_lets_a_running_episode_finalize(self, stop):
+    def test_stop_mcp_delegates_and_lets_the_episode_finalize(self, stop):
         process = MagicMock()
         process.poll.return_value = None
         with tempfile.TemporaryDirectory() as root:
-            rollout = Path(root) / "rollout"
-            rollout.mkdir(parents=True)
-            (rollout / "config.json").write_text("{}")  # the engine started
-            # Missing live.done: the episode still runs, so it gets its grace
-            # window instead of dying before the mp4 index is written.
-            with patch.object(codex.time, "monotonic",
-                              side_effect=[0] + [i * 0.25 for i in range(1, 10000)]), \
-                    patch.object(codex.time, "sleep") as sleep:
-                codex._stop_mcp(process, rollout, timeout=1, grace=0)
-            sleep.assert_any_call(0.25)
-            stop.assert_called_once_with(process)
-            # live.done present: short wait, then stop.
-            (rollout / "live.done").write_text("")
-            with patch.object(codex.time, "monotonic", return_value=0), \
-                    patch.object(codex.time, "sleep") as sleep:
-                codex._stop_mcp(process, rollout)
-            sleep.assert_any_call(1)
-            stop.assert_called_with(process)
-        # No engine ever started: skip the whole wait.
-        with tempfile.TemporaryDirectory() as root:
-            with patch.object(codex.time, "sleep") as sleep:
-                codex._stop_mcp(process, Path(root) / "rollout", timeout=300)
-            sleep.assert_not_called()
+            rollout = Path(root) / "rollout"  # no config.json: skip the wait
+            codex._stop_mcp(process, rollout, timeout=1)
+        stop.assert_called_once_with(process)
 
 
 if __name__ == "__main__":

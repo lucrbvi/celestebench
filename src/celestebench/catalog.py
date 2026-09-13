@@ -79,6 +79,17 @@ def producer(model: str) -> str | None:
     return next((lab for prefix, lab in _LABS if name.startswith(prefix)), None)
 
 
+# One model wearing several names: a gateway prefix, or an old label we used.
+# Fold them so the leaderboard compares models, not provider spellings.
+_MODEL_ALIASES = {"deepseek-flash": "deepseek-v4.1-flash"}
+
+
+def display_model(model: str) -> str:
+    """The model name the leaderboard shows and groups by."""
+    name = _basename(model)
+    return _MODEL_ALIASES.get(name, name)
+
+
 def producer_name(producer_id: str) -> str:
     return _LAB_NAMES.get(producer_id, producer_id.replace("-", " ").title())
 
