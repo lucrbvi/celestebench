@@ -98,8 +98,17 @@ def price(producer_id: str, model: str) -> dict | None:
     """models.dev cost (USD per million tokens) under a model's first-party lab."""
     name = _basename(model).lower()
     data = _models_dev()
-    for key, entry in (data.get(producer_id, {}).get("models") or {}).items():
+    lab = (data.get(producer_id, {}).get("models") or {})
+    for key, entry in lab.items():
         if _basename(key).lower() == name or (entry.get("id") or "").lower() == name:
+            return entry.get("cost")
+    # A gateway spells the id its own way (openrouter's "mistralai/mistral-medium-3-5"
+    # is the mistral lab's "mistral-medium-2604"), so the display name links them up.
+    aliases = {entry.get("name") for provider in data.values()
+               for entry in (provider.get("models") or {}).values()
+               if entry.get("name") and _basename(entry.get("id") or "").lower() == name}
+    for entry in lab.values():
+        if entry.get("name") in aliases:
             return entry.get("cost")
     wanted = f"{producer_id}/{name}"
     for provider in data.values():

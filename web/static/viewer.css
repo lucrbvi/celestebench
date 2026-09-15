@@ -46,6 +46,10 @@ video { width: 512px; height: 512px; image-rendering: pixelated; background: #00
 #leaderboardPage { display: block; width: min(1100px, 100%); }
 #leaderboardPage h2 { margin-bottom: 12px; }
 #leaderboardPage label { display: inline-flex; align-items: center; gap: 8px; margin: 10px 0 16px; }
+.modeswitch { display: inline-flex; border: 1px solid #444; margin: 10px 12px 16px 0; vertical-align: middle; }
+.modeswitch button { border: 0; border-right: 1px solid #444; background: #1a1a1a; padding: 5px 16px; color: #aaa; }
+.modeswitch button:last-child { border-right: 0; }
+.modeswitch button[aria-pressed="true"] { background: #243224; color: #cfc; }
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 8px; border-bottom: 1px solid #333; vertical-align: top; }
@@ -120,3 +124,14 @@ td .logo, td .logo-fallback { display: inline-block; vertical-align: -3px; margi
 .chart-tooltip { position: absolute; z-index: 2; pointer-events: none; background: #1c1c1c; border: 1px solid #444; padding: 6px 8px; max-width: 280px; font-size: 12px; }
 #chartEmpty { margin-bottom: 16px; }
 @media (max-width: 700px) { .chart-wrap { height: 260px; } }
+
+.row-toggle { display: flex; align-items: center; gap: 6px; margin: 0; padding: 0; border: 0; background: none; color: #ddd; font: inherit; text-align: left; }
+.row-toggle:hover { background: none; color: #cfc; }
+.row-toggle .logo, .row-toggle .logo-fallback { margin-right: 0; }
+.row-toggle .chev { font-size: 10px; line-height: 1; color: #777; transition: transform .15s ease; }
+.row-toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
+.run-detail > td { background: #151515; color: #999; }
+.run-detail .run-name { padding-left: 26px; }
+.run-indent { color: #555; margin-right: 7px; }
+.run-detail a { color: #bbb; }
+.run-detail a:hover { color: #cfc; }

@@ -45,6 +45,7 @@ class Harness:
     trace: str = ""  # external CLI JSON trace, e.g. codex.jsonl
     login_hint: str = ""
     concurrency: int = 0  # 0 = unlimited; N = at most N runs at once
+    oauth_only: bool = False  # True: the cap applies only to OAuth-subscription runs
     nested: bool = False  # rollout lives one directory below the run folder
     builtin: bool = False
     requires: str = ""
@@ -62,22 +63,12 @@ HARNESSES: dict[str, Harness] = {
                        "to route one model elsewhere, e.g. minimax-m3@minimax"),
             Field("thinking_level", "thinking", "choice", "low", choices=THINKING_LEVELS,
                   help="off, minimal, low, medium, high, xhigh or max; Tau maps it per API"),
-            Field("timeout", "timeout (s)", "number", 120,
-                  help="wall-clock budget for this run (seconds)"),
         ),
         options=(
             Field("provider", "provider", "choice", "opencode-go", source="providers"),
             Field("base_url", "base URL", "text", "http://localhost:8000/v1",
                   when=("provider", "custom")),
             Field("api_key", "API key", "secret"),
-            Field("max_frames", "max frames / action", "int", 30,
-                  help="Maximum frames one action holds a button"),
-            Field("max_actions", "max actions", "int", 4,
-                  help="Maximum actions the model may return per turn"),
-            Field("max_images", "max images", "int", 3, advanced=True,
-                  help="Cap on images kept in context; providers reject more"),
-            Field("fps", "FPS", "number", None, advanced=True,
-                  help="Run the game in real time at this speed; empty pauses the game"),
             Field("thinking_level", "default thinking level", "choice", "low",
                   choices=THINKING_LEVELS, advanced=True,
                   help="Used when a run leaves its own thinking field empty"),
@@ -90,25 +81,18 @@ HARNESSES: dict[str, Harness] = {
         nested=True,
         trace="codex.jsonl",
         requires="codex",
+        concurrency=1,
         note="Runs the host Codex CLI in an empty read-only workspace with shell "
              "network off. Authenticates with CODEX_API_KEY when set, otherwise the "
-             "host `codex login` ChatGPT session, which parallel runs share.",
+             "host `codex login` ChatGPT session; runs queue because they share it.",
         run=(
             Field("model", "model", required=True),
             Field("thinking_level", "reasoning", "choice", "low", choices=THINKING_LEVELS,
                   help="Passed to Codex as model_reasoning_effort; off means no reasoning"),
-            Field("timeout", "timeout (s)", "number", 120,
-                  help="wall-clock budget for this run (seconds)"),
         ),
         options=(
             Field("prompt", "task prompt", "textarea", PROMPT,
                   help="Message sent to the CLI; the game rules ride in the system prompt"),
-            Field("max_frames", "max frames / action", "int", 30,
-                  help="Maximum frames one action holds a button"),
-            Field("frames", "frame cap", "int", None, advanced=True,
-                  help="Cap on the total number of environment frames played"),
-            Field("fps", "FPS", "number", 30, advanced=True,
-                  help="Run the game in real time at this speed; empty pauses the game"),
         ),
     ),
     "opencode": Harness(
@@ -118,28 +102,23 @@ HARNESSES: dict[str, Harness] = {
         nested=True,
         trace="opencode.jsonl",
         requires="opencode",
+        concurrency=1,
+        oauth_only=True,
         note="Runs the host OpenCode CLI in an empty workspace with every built-in "
-             "tool denied, so it can only play through our MCP game server. Uses the "
-             "host `opencode auth login` session.",
+             "tool denied, so it can only play through our MCP game server. Gets a "
+             "throwaway config, data, state and cache home, so the host's config, "
+             "agents, plugins and MCP servers cannot leak in. Uses the host "
+             "`opencode auth login` session; OAuth-subscription runs queue on their "
+             "shared login while API-key models run in parallel.",
         run=(
             Field("model", "model", required=True,
                   help="OpenCode provider/model, e.g. opencode-go/deepseek-v4.1-flash"),
             Field("thinking_level", "reasoning", "choice", "low", choices=THINKING_LEVELS,
                   help="Passed to OpenCode as the model variant; off sends no variant"),
-            Field("timeout", "timeout (s)", "number", 120,
-                  help="wall-clock budget for this run (seconds)"),
         ),
         options=(
             Field("prompt", "kickoff prompt", "textarea", PROMPT,
                   help="Message sent to the CLI; the game rules ride in the agent's system prompt"),
-            Field("max_frames", "max frames / action", "int", 30,
-                  help="Maximum frames one action holds a button"),
-            Field("max_images", "max images / decision", "int", 3, advanced=True,
-                  help="Frames sampled into each observation"),
-            Field("frames", "frame cap", "int", None, advanced=True,
-                  help="Cap on the total number of environment frames played"),
-            Field("fps", "FPS", "number", 30, advanced=True,
-                  help="Run the game in real time at this speed; empty pauses the game"),
         ),
     ),
     "pi": Harness(
@@ -150,27 +129,20 @@ HARNESSES: dict[str, Harness] = {
         trace="pi.jsonl",
         requires="pi",
         concurrency=1,
+        oauth_only=True,
         note="Runs the host Pi CLI in an empty workspace with built-in tools off, "
-             "loading our bundled extension that bridges to the MCP game server. "
-             "Uses the host Pi login; runs queue because they share it.",
+             "loading our bundled extension that bridges to the MCP game server. Gets "
+             "a throwaway agent directory, so the host's settings, trust list, skills "
+             "and extensions cannot leak in. Uses the host Pi login; OAuth-subscription "
+             "runs queue on their shared login while API-key models run in parallel.",
         run=(
             Field("model", "model", required=True,
                   help="Pi model id, e.g. openai-codex/gpt-5.6-sol; bare ids use Pi's default provider"),
             Field("thinking_level", "thinking", "choice", "low", choices=THINKING_LEVELS),
-            Field("timeout", "timeout (s)", "number", 120,
-                  help="wall-clock budget for this run (seconds)"),
         ),
         options=(
             Field("prompt", "kickoff prompt", "textarea", PROMPT,
                   help="Message sent to the CLI; the game rules ride in the system prompt"),
-            Field("max_frames", "max frames / action", "int", 30,
-                  help="Maximum frames one action holds a button"),
-            Field("max_images", "max images / decision", "int", 3, advanced=True,
-                  help="Frames sampled into each observation"),
-            Field("frames", "frame cap", "int", None, advanced=True,
-                  help="Cap on the total number of environment frames played"),
-            Field("fps", "FPS", "number", 30, advanced=True,
-                  help="Run the game in real time at this speed; empty pauses the game"),
         ),
     ),
 }

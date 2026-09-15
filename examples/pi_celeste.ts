@@ -29,6 +29,13 @@ export default function (pi: ExtensionAPI) {
       ? JSON.parse(text.split("\n").find((line) => line.startsWith("data:"))!.slice(5))
       : JSON.parse(text);
     if (body.error) throw new Error(JSON.stringify(body.error));
+    if (body.result?.isError) {
+      const text = (body.result.content || [])
+        .filter((block: any) => block.type === "text")
+        .map((block: any) => block.text)
+        .join("\n");
+      throw new Error(text || "the game rejected this call");
+    }
     return (body.result?.content || []).map((block: any) =>
       block.type === "image"
         ? { type: "image" as const, data: block.data, mimeType: block.mimeType }

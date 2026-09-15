@@ -12,8 +12,9 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import av
 
-from celestebench import catalog, cost
+from celestebench import BENCHMARK_VERSION, catalog, cost
 from celestebench.harnesses import HARNESSES
+from celestebench.modes import mode_of
 
 from . import evals
 
@@ -161,7 +162,7 @@ def scan_runs() -> list[dict]:
 # prompt provenance is ignored so a verified and an unverified run of the same
 # setup share a row.
 _LEADERBOARD_SETTINGS = ("harness", "provider", "api", "base_url", "thinking_level",
-                         "thinking_budget", "fps", "max_frames", "max_actions",
+                         "thinking_budget", "fps", "max_frames",
                          "max_images", "frames", "strict_timeout", "lite")
 
 _THINKING_ALIASES = {"none": "off"}
@@ -183,8 +184,11 @@ def _run_settings(run: dict, config: dict, score: dict) -> dict:
     settings = {key: config.get(key) for key in _LEADERBOARD_SETTINGS if key in config}
     settings["harness"] = run.get("harness") or settings.get("harness") or "tau"
     settings["thinking_level"] = _thinking_level(config)
-    settings["benchmark_version"] = config.get("benchmark_version")
-    return {key: settings.get(key) for key in (*_LEADERBOARD_SETTINGS, "benchmark_version")}
+    settings["benchmark_version"] = config.get("benchmark_version") or score.get("benchmark_version")
+    settings["mode"] = (config.get("mode") if config.get("mode") in {"rtc", "lite"}
+                        else mode_of(settings.get("fps")))
+    return {key: settings.get(key)
+            for key in (*_LEADERBOARD_SETTINGS, "benchmark_version", "mode")}
 
 
 def _number(value) -> float | None:
@@ -207,10 +211,9 @@ def _progress_at(folder: Path, budget: float) -> float | None:
     return best[1] if best is not None else None
 
 
-def leaderboard(budget: float | None = None) -> dict:
-    """Aggregate grounded progress at one shared wall-clock budget."""
+def leaderboard(budget: float | None = None, mode: str | None = None) -> dict:
+    """Aggregate grounded progress at one shared wall-clock budget, for one mode."""
     candidates = []
-    budgets = set()
     excluded = {"replay": 0, "unknown_timing": 0}
     for run in scan_runs():
         folder = apply_nested(RUNS / run["name"])
@@ -228,9 +231,6 @@ def leaderboard(budget: float | None = None) -> dict:
         elif score and timing != "wall_clock":
             excluded["unknown_timing"] += 1
         elapsed = _number(score.get("elapsed"))
-        timeout = _number(run.get("timeout"))
-        if timeout is not None and timeout > 0:
-            budgets.add(timeout)
         config = _json(RUNS / run["name"] / "config.json")
         if folder != RUNS / run["name"]:
             config.update(_json(folder / "config.json"))
@@ -240,6 +240,17 @@ def leaderboard(budget: float | None = None) -> dict:
                           "usage": (RUNS / run["name"] / "codex.jsonl" if codex
                                     else folder / "messages.jsonl"),
                           "settings": _run_settings(run, config, score)})
+    # Old rollouts ran a different methodology; the leaderboard only ever shows
+    # the version this checkout defines, so runs are never compared across it.
+    candidates = [item for item in candidates
+                  if item["settings"]["benchmark_version"] == BENCHMARK_VERSION]
+    modes = sorted({item["settings"]["mode"] for item in candidates})
+    if mode not in modes:
+        mode = "rtc" if "rtc" in modes else (modes[0] if modes else "rtc")
+    candidates = [item for item in candidates if item["settings"]["mode"] == mode]
+    budgets = {timeout for timeout in
+               (_number(item["run"].get("timeout")) for item in candidates)
+               if timeout is not None and timeout > 0}
     if not budgets:
         budgets = {item["elapsed"] for item in candidates if item["elapsed"] is not None}
     choices = sorted(budgets)
@@ -265,10 +276,14 @@ def leaderboard(budget: float | None = None) -> dict:
             group["unscored"] += 1
         else:
             group["scores"].append(value)
-            group["scored_runs"].append({"name": run["name"], "progress": value})
+            # Keep each run's own cost so the table can unfold a whole row per
+            # run; the group average only counts the runs it could price.
+            entry = {"name": run["name"], "progress": value}
+            group["scored_runs"].append(entry)
             priced = cost.rollout_cost(item["usage"], model, codex=item["codex"])
             if priced is not None:
                 group["costs"].append(priced)
+                entry["cost"] = priced
     rows = []
     for group in groups.values():
         scores = group.pop("scores")
@@ -283,7 +298,8 @@ def leaderboard(budget: float | None = None) -> dict:
         group["status"] = "scored" if scores else "unscored"
         rows.append(group)
     rows.sort(key=lambda row: (row["progress"] is None, -(row["progress"] or 0), row["model"]))
-    return {"budget": budget, "budgets": choices, "groups": rows, "excluded": excluded}
+    return {"version": BENCHMARK_VERSION, "mode": mode, "modes": modes,
+            "budget": budget, "budgets": choices, "groups": rows, "excluded": excluded}
 
 
 def _codex_frame(item: dict) -> int | None:
@@ -323,12 +339,13 @@ def _codex_trace(run_folder: Path, outcomes: list[dict]) -> dict[int, dict]:
         elif kind == "agent_message":
             text.append(item.get("text") or "")
         elif kind == "mcp_tool_call" and item.get("tool") == "play":
+            # Every play closes its turn, even one that failed or hit an ended
+            # episode, so its reasoning cannot bleed into the next decision.
             decision = by_frame.get(_codex_frame(item))
-            if decision is None:
-                continue  # a play against an ended episode has no decision
-            merged[decision] = {"thinking": "\n".join(x for x in thinking if x) or None,
-                                "text": "\n".join(x for x in text if x) or None,
-                                "tool": item.get("arguments")}
+            if decision is not None:
+                merged[decision] = {"thinking": "\n".join(x for x in thinking if x) or None,
+                                    "text": "\n".join(x for x in text if x) or None,
+                                    "tool": item.get("arguments")}
             thinking, text = [], []
     return merged
 
@@ -500,12 +517,14 @@ class Handler(BaseHTTPRequestHandler):
         if request_path == "/api/evals":
             return self.json(evals.list_evals(RUNS))
         if request_path == "/api/leaderboard":
-            raw_budget = parse_qs(request.query).get("budget", [None])[0]
+            query = parse_qs(request.query)
+            raw_budget = query.get("budget", [None])[0]
             try:
                 selected = float(raw_budget) if raw_budget is not None else None
             except ValueError:
                 selected = None
-            return self.json(leaderboard(selected))
+            mode = query.get("mode", [None])[0]
+            return self.json(leaderboard(selected, mode if mode in {"rtc", "lite"} else None))
         if request_path == "/api/harnesses":
             return self.json(evals.harness_catalog())
         if request_path.startswith("/api/run/"):
@@ -535,6 +554,14 @@ class Handler(BaseHTTPRequestHandler):
             if job is None or job["status"] != "running":
                 return self.send_error(404)
             return self.live(folder, lambda: evals.job_running(job.get("id")))
+        if request_path.startswith("/frame/"):
+            # One short-lived PNG per request: many running cards polling this
+            # cannot exhaust the browser's per-host connection limit the way
+            # several long-lived /live/ streams would.
+            folder = (RUNS / unquote(request_path[len("/frame/"):])).resolve()
+            if not folder.is_relative_to(RUNS.resolve()):
+                return self.send_error(404)
+            return self.image(apply_nested(folder) / "live.png")
         if request_path.startswith("/video/"):
             path = (RUNS / unquote(request_path[len("/video/"):])).resolve()
             if not path.is_relative_to(RUNS.resolve()):
@@ -751,6 +778,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(404)
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:

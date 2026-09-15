@@ -1,8 +1,10 @@
 """Run the OpenCode CLI against our MCP game server, jailed to an empty workspace.
 
-OpenCode connects to MCP through its project ``opencode.json``; the generated
-agent denies every built-in tool except the ``celeste_*`` ones, so the model can
-only play the game. Its ``--format json`` events are normalized into the same
+OpenCode connects to MCP through the ``opencode.json`` we generate; the agent
+denies every built-in tool except the ``celeste_*`` ones, so the model can only
+play the game. The run gets a throwaway config/data/state/cache home and project
+discovery is off, so the host's config, agents, plugins and MCP servers never
+reach it. Its ``--format json`` events are normalized into the same
 messages.jsonl the viewer reads for Tau runs.
 """
 
@@ -22,7 +24,6 @@ INSTRUCTIONS = "instructions.txt"
 VARIANTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 
 stop_process = harness.stop_process
-free_port = harness.free_port
 wait_for_mcp = harness.wait_for_mcp
 limit_output = harness.limit_output
 
@@ -33,9 +34,13 @@ def _stop_mcp(process, rollout, timeout=0):
 
 def config(port, token):
     """OpenCode expands ``{...}`` in config strings, so the system prompt must
-    come from a file instead of being inlined (the game rules contain braces)."""
+    come from a file instead of being inlined (the game rules contain braces).
+    Sharing, snapshots and self-updates stay off so a run owns nothing on the host."""
     return {
         "$schema": "https://opencode.ai/config.json",
+        "share": "disabled",
+        "autoupdate": False,
+        "snapshot": False,
         "mcp": {
             "celeste": {
                 "type": "remote",
@@ -89,10 +94,11 @@ def resolve_model(model):
                      f"(for example opencode-go/deepseek-v4-flash).{hint}")
 
 
-def isolated_home(output):
-    """Point OpenCode's data and state dirs at this run so it never touches the
-    host's database, then symlink the host login back in. The cache and config
-    stay shared so the model catalog and provider setup are available."""
+def isolated_env(output):
+    """Give OpenCode a throwaway home for this run, so the host's config, agents,
+    plugins, MCP servers and database cannot leak in. Only the login is symlinked
+    back; the project config we wrote in the workspace loads through OPENCODE_CONFIG
+    while project discovery stays off, so no ancestor config can add tools."""
     home = output / "opencode"
     credentials = home / "data" / "opencode"
     credentials.mkdir(parents=True)
@@ -100,7 +106,15 @@ def isolated_home(output):
     for name in ("auth.json", "account.json"):
         if (source / name).is_file():
             (credentials / name).symlink_to(source / name)
-    return {"XDG_DATA_HOME": str(home / "data"), "XDG_STATE_HOME": str(home / "state")}
+    return {
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "XDG_DATA_HOME": str(home / "data"),
+        "XDG_STATE_HOME": str(home / "state"),
+        "XDG_CACHE_HOME": str(home / "cache"),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "OPENCODE_DISABLE_EXTERNAL_SKILLS": "1",
+        "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+    }
 
 
 def cli_error(path):
@@ -126,8 +140,11 @@ def _usage(total):
 
 
 def normalize(trace, messages):
-    """Fold OpenCode's event stream into one assistant row per play call."""
-    thinking, text, tool, tokens = [], [], None, None
+    """Fold OpenCode's event stream into one assistant row per play call.
+
+    Every step boundary clears the pending turn, so observe-only or errored
+    steps never leak their reasoning or tokens into the next play's row."""
+    thinking, text, tool, tool_error, tokens = [], [], None, False, None
     with Path(messages).open("x", encoding="utf-8") as out, Path(trace).open(
             encoding="utf-8", errors="replace") as source:
         for line in source:
@@ -140,14 +157,16 @@ def normalize(trace, messages):
             if kind in {"text", "reasoning"} and part.get("text"):
                 (thinking if kind == "reasoning" else text).append(part["text"])
             elif kind == "tool_use" and part.get("tool") == "celeste_play":
-                tool = (part.get("state") or {}).get("input")
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                tool = state.get("input")
+                tool_error = state.get("status") == "error" or bool(state.get("error"))
             elif kind == "step_finish":
                 tokens = _sum(tokens, part.get("tokens"))
-                if tool is not None:
+                if tool is not None and not tool_error:
                     row = harness.assistant("\n".join(thinking) or None, "\n".join(text) or None,
                                             tool, _usage(tokens))
                     out.write(json.dumps(row, separators=(",", ":")) + "\n")
-                    thinking, text, tool, tokens = [], [], None, None
+                thinking, text, tool, tool_error, tokens = [], [], None, False, None
 
 
 def _sum(total, tokens):
@@ -167,7 +186,7 @@ def _sum(total, tokens):
 def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
         thinking_level=None, max_images=3):
     model = resolve_model(model)
-    token, port = secrets.token_urlsafe(32), free_port()
+    token = secrets.token_urlsafe(32)
     rollout = harness.prepare(
         output,
         harness.run_config(model, timeout, frames, max_frames, fps, thinking_level),
@@ -178,11 +197,9 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     instructions = system_prompt(fps=fps, max_frames=max_frames,
                                  max_images=max_images, mcp=True, oneshot=True)
     (workspace / INSTRUCTIONS).write_text(instructions, encoding="utf-8")
-    (workspace / "opencode.json").write_text(
-        json.dumps(config(port, token), indent=2) + "\n", encoding="utf-8")
     env = os.environ.copy()
     # The host OpenCode (or a parent agent session) leaks inline config and
-    # identity vars into children; drop them so our project config wins.
+    # identity vars into children; drop them so our own config is the only one.
     for name in ("OPENCODE", "OPENCODE_PID", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
                  "OPENCODE_CONFIG_DIR", "OPENCODE_PERMISSION", "OPENCODE_DB",
                  "OPENCODE_SERVER_PASSWORD", "OPENCODE_SERVER_USERNAME", "OPENCODE_CLIENT"):
@@ -191,16 +208,20 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     # cwd= does not update $PWD, and OpenCode locates the project from $PWD, so
     # without this it loads our config from the wrong directory.
     env["PWD"] = str(workspace)
-    # A shared data dir means a shared SQLite database, which the host OpenCode
-    # may have open; isolate data/state and symlink just the login back in.
-    env |= isolated_home(output)
+    # Project discovery is off, so point OpenCode straight at our config file.
+    env["OPENCODE_CONFIG"] = str(workspace / "opencode.json")
+    env |= isolated_env(output)
     trace_path = output / "opencode.jsonl"
     mcp = subprocess.Popen(
-        harness.mcp_command(rollout, port=port, timeout=timeout, frames=frames,
+        harness.mcp_command(rollout, timeout=timeout, frames=frames,
                             max_frames=max_frames, max_images=max_images, fps=fps),
         env=env, start_new_session=True)
     try:
-        wait_for_mcp(mcp, token, port)
+        port = wait_for_mcp(mcp, token, output)
+        # The config carries the bearer token, so write it only once the port is
+        # known and delete it before the run is archived (see finally).
+        (workspace / "opencode.json").write_text(
+            json.dumps(config(port, token), indent=2) + "\n", encoding="utf-8")
         command = ["opencode", "run", "--pure", "--format", "json", "--agent", AGENT,
                    "--model", model, "--title", AGENT]
         chosen = variant(thinking_level)
@@ -218,6 +239,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
         if not (rollout / "config.json").is_file():
             harness.fail(trace_path, "OpenCode finished without using the game tools")
     finally:
+        (workspace / "opencode.json").unlink(missing_ok=True)
         _stop_mcp(mcp, rollout, timeout)
 
 

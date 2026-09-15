@@ -2,8 +2,10 @@
 
 Pi has no MCP client built in, so we load examples/pi_celeste.ts with -e: it
 registers play/observe tools that forward to the episode server this script
-owns. Built-in tools stay off. Pi's --mode json events are normalized into the
-same messages.jsonl the viewer reads for Tau runs.
+owns. Built-in tools stay off, and the run gets a throwaway agent directory so
+the host's settings, trust list, extensions and skills never reach it. Pi's
+--mode json events are normalized into the same messages.jsonl the viewer reads
+for Tau runs.
 """
 
 import argparse
@@ -19,13 +21,30 @@ from celestebench.prompt import system_prompt
 EXTENSION = Path(__file__).with_name("pi_celeste.ts")
 
 stop_process = harness.stop_process
-free_port = harness.free_port
 wait_for_mcp = harness.wait_for_mcp
 limit_output = harness.limit_output
 
 
 def _stop_mcp(process, rollout, timeout=0):
     harness.stop_mcp(process, rollout, timeout, stop=stop_process)
+
+
+def host_agent_dir():
+    """The host Pi agent directory whose login and model catalog we borrow."""
+    return Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+
+
+def isolated_home(output):
+    """Give Pi a throwaway agent directory for this run, so the host's settings,
+    trust list, extensions and skills cannot leak in. Only the login and the
+    model catalog are symlinked back, and --offline keeps Pi from refreshing them."""
+    source = host_agent_dir()
+    agent = output / "pi" / "agent"
+    agent.mkdir(parents=True)
+    for name in ("auth.json", "models.json", "models-store.json"):
+        if (source / name).is_file():
+            (agent / name).symlink_to(source / name)
+    return {"PI_CODING_AGENT_DIR": str(agent)}
 
 
 def cli_error(path):
@@ -42,20 +61,23 @@ def cli_error(path):
 def _sum(total, usage):
     if not isinstance(usage, dict):
         return total
-    total = total or {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+    total = total or {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
                       "total": 0, "reasoning": 0}
     total["input"] += usage.get("input") or 0
     total["output"] += usage.get("output") or 0
-    total["cacheRead"] += usage.get("cacheRead") or 0
-    total["cacheWrite"] += usage.get("cacheWrite") or 0
+    total["cache_read"] += usage.get("cacheRead") or 0
+    total["cache_write"] += usage.get("cacheWrite") or 0
     total["total"] += usage.get("totalTokens") or usage.get("total") or 0
     total["reasoning"] += usage.get("reasoning") or 0
     return total
 
 
 def normalize(trace, messages):
-    """Fold Pi's event stream into one assistant row per completed play call."""
-    thinking, text, tool, tokens = [], [], None, None
+    """Fold Pi's event stream into one assistant row per completed play call.
+
+    Each assistant turn replaces the pending one, so an observe-only or failed
+    turn never leaks its reasoning or tokens into the next play's row."""
+    turn = None
     with Path(messages).open("x", encoding="utf-8") as out, Path(trace).open(
             encoding="utf-8", errors="replace") as source:
         for line in source:
@@ -68,6 +90,7 @@ def normalize(trace, messages):
                 message = event["message"]
                 if message.get("role") != "assistant":
                     continue
+                thinking, text, tool = [], [], None
                 for block in message.get("content") or []:
                     if not isinstance(block, dict):
                         continue
@@ -77,26 +100,24 @@ def normalize(trace, messages):
                         text.append(block.get("text") or "")
                     elif block.get("type") == "toolCall" and block.get("name") == "play":
                         tool = block.get("arguments")
-                tokens = _sum(tokens, message.get("usage"))
+                turn = thinking, text, tool, _sum(None, message.get("usage"))
             elif kind == "tool_execution_end" and event.get("toolName") == "play":
-                if event.get("isError") or tool is None:
+                if event.get("isError") or turn is None or turn[2] is None:
                     continue
+                thinking, text, tool, tokens = turn
                 row = harness.assistant(
                     "\n".join(x for x in thinking if x) or None,
                     "\n".join(x for x in text if x) or None,
                     tool,
-                    harness.usage(input=tokens["input"], output=tokens["output"],
-                                  cache_read=tokens["cacheRead"], cache_write=tokens["cacheWrite"],
-                                  total=tokens["total"] or None,
-                                  reasoning=tokens["reasoning"] or None) if tokens else None,
+                    harness.usage(**tokens) if tokens else None,
                 )
                 out.write(json.dumps(row, separators=(",", ":")) + "\n")
-                thinking, text, tool, tokens = [], [], None, None
+                turn = None
 
 
 def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
         thinking_level=None, max_images=3):
-    token, port = secrets.token_urlsafe(32), free_port()
+    token = secrets.token_urlsafe(32)
     rollout = harness.prepare(
         output,
         harness.run_config(model, timeout, frames, max_frames, fps, thinking_level),
@@ -107,8 +128,8 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     instructions = system_prompt(fps=fps, max_frames=max_frames,
                                  max_images=max_images, mcp=True, oneshot=True)
     env = os.environ.copy()
+    env |= isolated_home(output)
     env |= {
-        "CELESTEBENCH_MCP_URL": f"http://127.0.0.1:{port}/mcp",
         "CELESTEBENCH_MCP_TOKEN": token,
         "CELESTEBENCH_MAX_FRAMES": str(max_frames),
         # cwd= does not update $PWD; keep the child's idea of its directory sane.
@@ -116,15 +137,17 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     }
     trace_path = output / "pi.jsonl"
     mcp = subprocess.Popen(
-        harness.mcp_command(rollout, port=port, timeout=timeout, frames=frames,
+        harness.mcp_command(rollout, timeout=timeout, frames=frames,
                             max_frames=max_frames, max_images=max_images, fps=fps),
         env=env, start_new_session=True)
     try:
-        wait_for_mcp(mcp, token, port)
+        port = wait_for_mcp(mcp, token, output)
+        env["CELESTEBENCH_MCP_URL"] = f"http://127.0.0.1:{port}/mcp"
         command = [
             "pi", "--print", "--mode", "json", "--no-session", "--no-extensions",
             "--no-builtin-tools", "--no-context-files", "--no-skills",
-            "--no-prompt-templates", "--model", model,
+            "--no-prompt-templates", "--no-approve", "--offline",
+            "--model", model,
             "--system-prompt", instructions, "--extension", str(EXTENSION),
         ]
         if thinking_level:

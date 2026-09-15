@@ -35,7 +35,6 @@ enabled = false
 """
 
 
-free_port = harness.free_port
 wait_for_mcp = harness.wait_for_mcp
 stop_process = harness.stop_process
 limit_output = harness.limit_output
@@ -89,14 +88,14 @@ def oauth_login():
 
 
 def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
-        thinking_level=None):
+        thinking_level=None, max_images=3):
     api_key = os.environ.get("CODEX_API_KEY") or None
     if api_key and "\n" in api_key:
         raise SystemExit("CODEX_API_KEY must not contain a newline")
     login = oauth_login()
     if api_key is None and not login.is_file():
         raise SystemExit("Set CODEX_API_KEY or run `codex login` before launching Codex")
-    token, port = secrets.token_urlsafe(32), free_port()
+    token = secrets.token_urlsafe(32)
     rollout = harness.prepare(
         output,
         harness.run_config(model, timeout, frames, max_frames, fps, thinking_level),
@@ -105,7 +104,8 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
     workspace = output / "workspace"
     workspace.mkdir()
     mcp_args = harness.mcp_command(
-        rollout, port=port, timeout=timeout, frames=frames, max_frames=max_frames, fps=fps)
+        rollout, timeout=timeout, frames=frames, max_frames=max_frames,
+        max_images=max_images, fps=fps)
     env = os.environ.copy()
     env.pop("CODEX_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
@@ -122,10 +122,11 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
             (home / "auth.json").symlink_to(login)
         mcp = subprocess.Popen(mcp_args, env=env, start_new_session=True)
         try:
-            wait_for_mcp(mcp, token, port)
+            port = wait_for_mcp(mcp, token, output)
             # Codex never forwards the MCP server's `instructions` to the model,
             # so the game rules must be injected as developer instructions.
-            instructions = system_prompt(fps=fps, max_frames=max_frames, mcp=True, oneshot=True)
+            instructions = system_prompt(fps=fps, max_frames=max_frames,
+                                         max_images=max_images, mcp=True, oneshot=True)
             codex = [
                 "codex",
                 "exec",
@@ -149,6 +150,12 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
                 "features.apps=false",
                 "-c",
                 "features.plugins=false",
+                # The run workspace sits inside this repo, so Codex discovers the
+                # repo's AGENTS.md and tries to read it inside the read-only jail
+                # below; the denied read aborts session creation. Zero bytes of
+                # project doc keeps the repo's own rules out of the model context.
+                "-c",
+                "project_doc_max_bytes=0",
                 # Codex spawns shell commands with the whole environment by
                 # default, which would hand the model our API key and MCP token.
                 "-c",
@@ -168,18 +175,31 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
             if effort:
                 codex += ["-c", f"model_reasoning_effort={effort}"]
             codex.append("-")
-            with (output / "codex.jsonl").open("xb") as trace:
-                subprocess.run(
-                    codex,
-                    cwd=workspace,
-                    env=codex_env,
-                    input=prompt,
-                    text=True,
-                    stdout=trace,
-                    check=True,
-                    timeout=timeout + 30,
-                    preexec_fn=limit_output,
-                )
+            trace_path = output / "codex.jsonl"
+            with trace_path.open("xb") as trace:
+                try:
+                    completed = subprocess.run(
+                        codex,
+                        cwd=workspace,
+                        env=codex_env,
+                        input=prompt,
+                        text=True,
+                        stdout=trace,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout + 30,
+                        preexec_fn=limit_output,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    harness.fail(trace_path, f"Codex timed out after {timeout + 30}s")
+            # A failed run must report Codex's own last stderr line; the raw
+            # CalledProcessError used to leak the whole argv (system prompt and all).
+            if completed.returncode != 0:
+                lines = (completed.stderr or "").strip().splitlines()
+                harness.fail(trace_path, lines[-1][:1000] if lines
+                             else f"Codex exited with code {completed.returncode}")
+            if not (rollout / "config.json").is_file():
+                harness.fail(trace_path, "Codex finished without using the game tools")
         finally:
             _stop_mcp(mcp, rollout, timeout)
 
@@ -192,6 +212,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--frames", type=int)
     parser.add_argument("--max-frames", type=int, default=30)
+    parser.add_argument("--max-images", type=int, default=3)
     parser.add_argument("--thinking-level")
     parser.add_argument("--fps", type=float)
     args = parser.parse_args()
@@ -200,10 +221,11 @@ def main():
         or args.frames is not None
         and args.frames <= 0
         or args.max_frames <= 0
+        or args.max_images <= 0
         or args.fps is not None
         and args.fps <= 0
     ):
-        parser.error("timeout, frames, max-frames, and fps must be positive")
+        parser.error("timeout, frames, max-frames, max-images, and fps must be positive")
     run(
         args.prompt,
         args.model,
@@ -213,6 +235,7 @@ def main():
         args.frames,
         args.max_frames,
         args.thinking_level,
+        args.max_images,
     )
 
 

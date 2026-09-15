@@ -1,0 +1,18 @@
+{
+  "rtc": {
+    "label": "RTC",
+    "description": "The game runs in real time and keeps moving while the model thinks.",
+    "fps": 30,
+    "timeout": 300,
+    "max_frames": 30,
+    "max_images": 3
+  },
+  "lite": {
+    "label": "Lite",
+    "description": "The game pauses while the model thinks.",
+    "fps": null,
+    "timeout": 300,
+    "max_frames": 30,
+    "max_images": 3
+  }
+}

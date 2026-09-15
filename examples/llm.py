@@ -17,6 +17,7 @@ from tau_coding.models_dev_store import (
 
 from celestebench import BENCHMARK_VERSION, providers
 from celestebench.llm import TauPolicy
+from celestebench.modes import mode_of
 from celestebench.rollout import rollout
 
 
@@ -33,14 +34,13 @@ async def main():
     parser.add_argument("--timeout", type=float, default=120,
                         help="wall-clock budget for the whole rollout, in seconds")
     parser.add_argument("--max-frames", type=int, default=30)
-    parser.add_argument("--max-actions", type=int, default=4)
     parser.add_argument("--frames", type=int, help="cap on total environment frames played")
     parser.add_argument("--fps", type=float, help="run the environment in real time at this rate")
     parser.add_argument("--max-images", type=int, default=3,
                         help="cap on images kept in the model context (providers reject more)")
     parser.add_argument("--output", type=Path, help="fresh directory (default: runs/MODEL/TIMESTAMP)")
     args = parser.parse_args()
-    if min(args.max_frames, args.max_actions, args.timeout) <= 0:
+    if min(args.max_frames, args.timeout) <= 0:
         parser.error("budgets must be positive")
     try:
         await refresh_models_dev_catalog()  # fresh model data; the bundled snapshot is the fallback
@@ -72,7 +72,7 @@ async def main():
             args.output = Path("runs") / model_name / f"{stamp}-{suffix}"
             suffix += 1
     # The runner owns directory creation, so refuse overwrites before opening logs.
-    policy = TauPolicy(provider, args.model, max_frames=args.max_frames, max_actions=args.max_actions,
+    policy = TauPolicy(provider, args.model, max_frames=args.max_frames,
                        max_images=args.max_images, fps=args.fps)
     try:
         # Open the trace only after rollout has created its output directory.
@@ -81,14 +81,14 @@ async def main():
                 policy.trace = Trace((args.output / "messages.jsonl").open("xb"), encoding="utf-8")
                 config = {name: value for name, value in vars(args).items() if name != "api_key"} | {
                     "output": str(args.output), "system": policy.system,
-                    "system_prompt_sent": True, "benchmark_version": BENCHMARK_VERSION,
-                    "tau_version": "0.4.1", "max_retries": 0,
+                    "mode": mode_of(args.fps), "benchmark_version": BENCHMARK_VERSION,
+                    "system_prompt_sent": True, "tau_version": "0.4.1", "max_retries": 0,
                     "session": session}
                 (args.output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
             return await policy(frames)
 
         result = await rollout(decide, args.output, timeout=args.timeout,
-                               max_frames=args.max_frames, max_actions=args.max_actions,
+                               max_frames=args.max_frames,
                                frames=args.frames, fps=args.fps)
         print(json.dumps(result))
     finally:

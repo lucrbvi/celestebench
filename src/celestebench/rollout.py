@@ -12,6 +12,7 @@ from pathlib import Path
 
 import av
 
+from . import BENCHMARK_VERSION
 from .open8 import Open8
 from .scoring import Progress
 
@@ -35,7 +36,7 @@ def _int(value, name):
 
 
 async def rollout(policy, output: str | Path, *, timeout: float | None = None,
-                  max_frames: int = 30, max_actions: int = 1,
+                  max_frames: int = 30,
                   frames: int | None = None, fps: float | None = None,
                   strict_timeout: bool = False) -> dict:
     """Run ``policy``, which receives every frame played since its previous call
@@ -54,13 +55,12 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                                 or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError("timeout must be a positive number of seconds")
     max_frames = _int(max_frames, "max_frames")
-    max_actions = _int(max_actions, "max_actions")
     if frames is not None:
         frames = _int(frames, "frames")
     if fps is not None and fps <= 0:
         raise ValueError("fps must be positive")
-    if max_frames < 1 or max_actions < 1 or (frames is not None and frames < 1):
-        raise ValueError("max_frames and max_actions must be positive")
+    if max_frames < 1 or (frames is not None and frames < 1):
+        raise ValueError("max_frames must be positive")
     period = None if fps is None else 1.0 / fps
 
     directory = Path(output)
@@ -79,10 +79,11 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
     calls = 0
     progress = Progress()
     scoring_options = dict(timeout=timeout, fps=fps, max_frames=max_frames,
-                           max_actions=max_actions, frames=frames, strict_timeout=strict_timeout)
+                           frames=frames, strict_timeout=strict_timeout)
 
     def save_score(status):
-        score = {**progress.snapshot(), "elapsed": time.perf_counter() - started,
+        score = {**progress.snapshot(), "benchmark_version": BENCHMARK_VERSION,
+                 "elapsed": time.perf_counter() - started,
                  "frame": stepped, "timing": "wall_clock", "status": status,
                  "options": scoring_options}
         temporary = directory / "score.tmp"
@@ -192,8 +193,8 @@ async def rollout(policy, output: str | Path, *, timeout: float | None = None,
                             raise TypeError("policy must return (buttons, frames) or a list of those")
                         if len(result) == 2 and not isinstance(result[0], (list, tuple)):
                             result = [result]
-                        if not 1 <= len(result) <= max_actions:
-                            raise ValueError("policy must return 1..max_actions actions")
+                        if not result:
+                            raise ValueError("policy must return at least one action")
                         batch = []
                         for action in result:
                             try:

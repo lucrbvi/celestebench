@@ -7,7 +7,7 @@ import hmac
 import json
 import math
 import os
-import sys
+import socket
 from contextlib import suppress
 from pathlib import Path
 
@@ -81,7 +81,7 @@ class Episode:
             return
         options = {key: self.options[key] for key in ("timeout", "frames", "fps", "max_frames")}
         self._task = asyncio.create_task(self.runner(
-            self._policy, self.output, max_actions=sys.maxsize, strict_timeout=True, **options))
+            self._policy, self.output, strict_timeout=True, **options))
         self._task.add_done_callback(self._finished)
 
     def _finished(self, task):
@@ -242,7 +242,8 @@ def _parser():
     parser.add_argument("--lite", action="store_true")
     parser.add_argument("--max-frames", type=int, default=30)
     parser.add_argument("--max-images", type=int, default=3)
-    parser.add_argument("--port", type=int, default=8124)
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--port-file", help="write the bound port here once listening")
     return parser
 
 
@@ -260,8 +261,8 @@ async def _main(args):
         raise SystemExit("--timeout and --frames must be positive")
     if not math.isfinite(args.fps) or args.fps <= 0 or args.max_frames < 1 or args.max_images < 1:
         raise SystemExit("--fps, --max-frames, and --max-images must be positive")
-    if not 1 <= args.port <= 65535:
-        raise SystemExit("--port must be from 1 to 65535")
+    if not 0 <= args.port <= 65535:
+        raise SystemExit("--port must be from 0 to 65535")
     episode = Episode(args.output, timeout=args.timeout, frames=args.frames,
                       fps=None if args.lite else args.fps,
                       max_frames=args.max_frames, max_images=args.max_images)
@@ -275,9 +276,15 @@ async def _main(args):
             if not token:
                 raise SystemExit("CELESTEBENCH_MCP_TOKEN is required for HTTP")
             import uvicorn
+            # Bind here so the port is ours before we announce it; the token is
+            # only ever sent to this process, never to a port someone else won.
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", args.port))
+            if args.port_file:
+                Path(args.port_file).write_text(str(listener.getsockname()[1]), encoding="utf-8")
             await uvicorn.Server(uvicorn.Config(
-                BearerAuth(app.streamable_http_app(), token), host="127.0.0.1",
-                port=args.port, log_level="warning")).serve()
+                BearerAuth(app.streamable_http_app(), token),
+                log_level="warning")).serve(sockets=[listener])
     finally:
         await episode.close()
 

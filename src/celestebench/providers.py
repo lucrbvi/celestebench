@@ -3,7 +3,7 @@
 import os
 from dataclasses import replace
 
-from tau_ai import AnthropicConfig, AnthropicProvider
+from tau_ai import AnthropicConfig, AnthropicProvider, openai_compatible
 from tau_coding.catalog_loader import effective_catalog
 from tau_coding.provider_config import (
     OpenAICompatibleProviderConfig,
@@ -32,6 +32,21 @@ _NPM_APIS = {
     "@ai-sdk/openai-compatible": "openai-completions",
 }
 
+
+_tau_chat_messages = openai_compatible._messages_to_openai_chat
+
+
+def _messages_without_tool_name(messages, *, supports_images):
+    """Drop the "name" Tau adds to tool messages. OpenAI has no such field
+    there, and opencode-go's strict upstream answers 400 when it is present."""
+    return [
+        {key: value for key, value in message.items() if key != "name"}
+        if message.get("role") == "tool" else message
+        for message in _tau_chat_messages(messages, supports_images=supports_images)
+    ]
+
+
+openai_compatible._messages_to_openai_chat = _messages_without_tool_name
 
 
 class _StaticCredentials:

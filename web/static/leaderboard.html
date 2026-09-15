@@ -2,7 +2,11 @@
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>leaderboard · celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
 <body>
 <header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/runs">runs</a><a href="/evals">evaluations</a><a href="/leaderboard" aria-current="page">leaderboard</a></nav></header>
-<main id="leaderboardPage"><section><h2>leaderboard</h2>
+<main id="leaderboardPage"><section><h2>leaderboard <span id="benchmarkVersion" class="meta"></span></h2>
+<div id="modeSwitch" class="modeswitch" role="group" aria-label="benchmark mode">
+  <button type="button" data-mode="rtc">RTC</button>
+  <button type="button" data-mode="lite">Lite</button>
+</div>
 <label id="budgetControl">budget <select id="budget" aria-label="wall-clock budget"></select></label>
 <div id="leaderboardControls" hidden>
   <div class="selector">
@@ -19,7 +23,6 @@
       <div id="harnessList"></div>
     </div>
   </div>
-  <span id="benchmarkVersion" class="meta"></span>
 </div>
 <div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
 <div id="chartEmpty" class="meta" hidden>no cost data</div>
@@ -43,12 +46,12 @@ const color = g => {
   return `hsl(${h} 68% 62%)`;
 };
 const HARNESS = {
-  tau: { name: "CelesteBench", dash: null, shape: "circle", color: "hsl(210 80% 62%)" },
-  codex: { name: "Codex", dash: "6 3", shape: "square", color: "hsl(285 70% 70%)" },
-  opencode: { name: "OpenCode", dash: "2 4", shape: "triangle", color: "hsl(35 85% 60%)" },
-  pi: { name: "Pi", dash: "8 2 2 2", shape: "diamond", color: "hsl(150 55% 55%)" },
+  tau: { name: "CelesteBench", shape: "circle", color: "hsl(210 80% 62%)" },
+  codex: { name: "Codex", shape: "square", color: "hsl(285 70% 70%)" },
+  opencode: { name: "OpenCode", shape: "triangle", color: "hsl(35 85% 60%)" },
+  pi: { name: "Pi", shape: "diamond", color: "hsl(150 55% 55%)" },
 };
-const harness = key => HARNESS[key] || { name: key, dash: "1 3", shape: "diamond", color: "hsl(0 0% 65%)" };
+const harness = key => HARNESS[key] || { name: key, shape: "diamond", color: "hsl(0 0% 65%)" };
 const SHAPE_CSS = {
   circle: "border-radius:50%", square: "border-radius:0",
   triangle: "clip-path:polygon(50% 0,100% 100%,0 100%)",
@@ -62,16 +65,34 @@ function marker(shape, x, y, color, i) {
   if (shape === "diamond") return `<polygon points="${x},${y - 4.5} ${x + 4.5},${y} ${x},${y + 4.5} ${x - 4.5},${y}" ${attrs}/>`;
   return `<circle cx="${x}" cy="${y}" r="4" ${attrs}/>`;
 }
+// Min–max range bars, the standard way to show run spread around a mean point.
+function rangeBar(x0, y0, x1, y1, c) {
+  const cap = 3.5, attrs = `stroke="${c}" stroke-width="1" opacity=".45"`;
+  if (x0 === x1) return `<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" ${attrs}/>` +
+    `<line x1="${x0 - cap}" y1="${y0}" x2="${x0 + cap}" y2="${y0}" ${attrs}/>` +
+    `<line x1="${x1 - cap}" y1="${y1}" x2="${x1 + cap}" y2="${y1}" ${attrs}/>`;
+  return `<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y1}" ${attrs}/>` +
+    `<line x1="${x0}" y1="${y0 - cap}" x2="${x0}" y2="${y0 + cap}" ${attrs}/>` +
+    `<line x1="${x1}" y1="${y1 - cap}" x2="${x1}" y2="${y1 + cap}" ${attrs}/>`;
+}
 const harnessKey = row => (row.settings || {}).harness || "tau";
 const harnessName = row => harness(harnessKey(row)).name;
 const usd = v => "$" + (v >= 0.01 ? v.toFixed(3) : v.toPrecision(3));
 const level = s => s.thinking_level || s.reasoning_effort || "—";
 const RANK = {off: 0, none: 0, minimal: 1, light: 2, low: 2, medium: 3, high: 4, xhigh: 5, max: 6};
 const rank = s => RANK[String(s.thinking_level || s.reasoning_effort || "").toLowerCase()] ?? 3.5;
-const shortModel = m => String(m).replace(/^.*\//, "").replace(/-contributor$/, "");
+const shortModel = m => String(m).replace(/^.*\//, "");
 const readSaved = () => { try { return JSON.parse(localStorage.celestebenchHiddenModels || "null"); } catch { return null; } };
 const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celestebenchHiddenHarnesses || "null"); } catch { return null; } };
 let plottable = [], selectedModels = new Set(), selectedHarnesses = new Set(), scoredRows = [], chartPoints = [];
+let currentMode = localStorage.celestebenchMode || "rtc";
+let loadSeq = 0;
+function renderModeSwitch(modes) {
+  $("modeSwitch").querySelectorAll("button").forEach(button => {
+    button.hidden = modes.length > 0 && !modes.includes(button.dataset.mode);
+    button.setAttribute("aria-pressed", String(button.dataset.mode === currentMode));
+  });
+}
 
 function logoHtml(row) {
   const letter = esc(String(row.producer_name || row.model || "?").trim().charAt(0).toUpperCase());
@@ -79,13 +100,15 @@ function logoHtml(row) {
   if (!row.producer) return dot;
   return `<img class="logo" src="/logos/${encodeURIComponent(row.producer)}.svg" alt="" onerror="this.hidden=true;this.nextElementSibling.hidden=false">` + dot;
 }
-const models = () => [...new Set(plottable.map(g => g.model))];
+const models = () => [...new Set([...plottable, ...scoredRows].map(g => g.model))];
 const harnesses = () => [...new Set([...plottable, ...scoredRows].map(harnessKey))];
 // Persist what the user hid, not what they kept, so newly recorded models and
 // harnesses show up by default instead of staying filtered out.
 function saveHidden() {
-  localStorage.celestebenchHiddenModels = JSON.stringify(models().filter(m => !selectedModels.has(m)));
-  localStorage.celestebenchHiddenHarnesses = JSON.stringify(harnesses().filter(h => !selectedHarnesses.has(h)));
+  try {
+    localStorage.celestebenchHiddenModels = JSON.stringify(models().filter(m => !selectedModels.has(m)));
+    localStorage.celestebenchHiddenHarnesses = JSON.stringify(harnesses().filter(h => !selectedHarnesses.has(h)));
+  } catch {}
 }
 function renderSummary() {
   $("selectorToggle").textContent = `${selectedModels.size} of ${models().length} models`;
@@ -98,6 +121,7 @@ function setModels(on) {
   saveHidden();
   renderSummary();
   renderChart();
+  renderTable();
 }
 
 function setHarnesses(on) {
@@ -109,11 +133,9 @@ function setHarnesses(on) {
   renderTable();
 }
 
-function buildSelector(groups) {
-  const version = [...new Set(groups.map(g => (g.settings || {}).benchmark_version).filter(Boolean))];
-  $("benchmarkVersion").textContent = version.length ? "CelesteBench v" + version.join(", v") : "";
+function buildSelector() {
   const seen = new Set();
-  $("selectorList").innerHTML = plottable.map(g => {
+  $("selectorList").innerHTML = [...plottable, ...scoredRows].map(g => {
     if (seen.has(g.model)) return "";
     seen.add(g.model);
     return `<label class="selector-row"><input type="checkbox" data-model="${esc(g.model)}"${selectedModels.has(g.model) ? " checked" : ""}><span class="swatch" style="--c:${color(g)}"></span>${logoHtml(g)}<span class="selector-name">${esc(g.model)}</span><span class="meta">${esc(g.producer_name || "")}</span></label>`;
@@ -123,6 +145,7 @@ function buildSelector(groups) {
     saveHidden();
     renderSummary();
     renderChart();
+    renderTable();
   });
   const seenHarnesses = new Set();
   $("harnessList").innerHTML = [...plottable, ...scoredRows].map(g => {
@@ -148,13 +171,14 @@ function renderChart() {
   if (!plottable.length) { wrap.hidden = true; $("chartEmpty").hidden = false; return; }
   wrap.hidden = false; $("chartEmpty").hidden = true;
   const pts = plottable.filter(g => selectedModels.has(g.model) && selectedHarnesses.has(harnessKey(g)));
-  const base = pts.length ? pts : plottable;
+  if (!pts.length) { svg.innerHTML = ""; chartPoints = []; return; }
+  const base = pts;
   const W = 820, H = 380, L = 58, R = 24, T = 20, B = 42;
   const pw = W - L - R, ph = H - T - B;
-  const logs = base.map(p => Math.log10(p.cost));
+  const logs = base.flatMap(p => [p.cost, ...(p.scored_runs || []).map(r => r.cost).filter(Number.isFinite)]).map(Math.log10);
   let lo = Math.min(...logs), hi = Math.max(...logs);
   if (lo === hi) { lo -= 0.5; hi += 0.5; }
-  const scores = base.map(p => p.progress);
+  const scores = base.flatMap(p => [p.progress, ...(p.scored_runs || []).map(r => r.progress).filter(Number.isFinite)]);
   const pad = (Math.max(...scores) - Math.min(...scores)) * 0.08 || 1;
   const y0 = Math.max(0, Math.min(...scores) - pad), y1 = Math.max(...scores) + pad;
   const X = c => L + (Math.log10(c) - lo) / (hi - lo) * pw;
@@ -163,11 +187,18 @@ function renderChart() {
   for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) powers.push(10 ** e);
   const xticks = [...new Set([...powers, 10 ** lo, 10 ** hi].map(v => Number(v.toPrecision(4))))].sort((a, b) => a - b);
   const yticks = Array.from({ length: 5 }, (_, i) => y0 + (y1 - y0) * i / 4);
+  // A small score range rounds several ticks to the same label; pick the
+  // decimals from the span, and drop x ticks that would print on top of each other.
+  const span = y1 - y0;
+  const decimals = span >= 10 ? 0 : span >= 1 ? 1 : span >= 0.1 ? 2 : 3;
+  const xlabels = [];
+  for (const [v, x] of xticks.map(v => [v, X(v)]).sort((a, b) => a[1] - b[1]))
+    if (!xlabels.length || x - xlabels.at(-1)[1] > 44) xlabels.push([v, x]);
 
   let s = yticks.map(v => `<line x1="${L}" y1="${Y(v)}" x2="${L + pw}" y2="${Y(v)}" stroke="#262626"/>` +
-    `<text x="${L - 8}" y="${Y(v) + 3}" text-anchor="end" fill="#777" font-size="11">${v.toFixed(1)}</text>`).join("");
-  s += xticks.map(v => `<line x1="${X(v)}" y1="${T}" x2="${X(v)}" y2="${T + ph}" stroke="#262626"/>` +
-    `<text x="${X(v)}" y="${T + ph + 16}" text-anchor="middle" fill="#777" font-size="11">${usd(v)}</text>`).join("");
+    `<text x="${L - 8}" y="${Y(v) + 3}" text-anchor="end" fill="#777" font-size="11">${v.toFixed(decimals)}</text>`).join("");
+  s += xlabels.map(([v, x]) => `<line x1="${x}" y1="${T}" x2="${x}" y2="${T + ph}" stroke="#262626"/>` +
+    `<text x="${x}" y="${T + ph + 16}" text-anchor="middle" fill="#777" font-size="11">${usd(v)}</text>`).join("");
   s += `<line x1="${L}" y1="${T + ph}" x2="${L + pw}" y2="${T + ph}" stroke="#444"/>` +
     `<line x1="${L}" y1="${T}" x2="${L}" y2="${T + ph}" stroke="#444"/>` +
     `<text x="${L + pw / 2}" y="${H - 4}" text-anchor="middle" fill="#999" font-size="12">avg API cost (USD) per rollout</text>` +
@@ -180,10 +211,18 @@ function renderChart() {
     const key = p.model + "|" + harnessKey(p);
     if (!drawn.has(key)) {
       drawn.add(key);
+      // The x axis is cost, so the line must follow cost, never thinking rank:
+      // connecting by rank makes it double back whenever the two disagree.
       const rows = pts.filter(q => q.model === p.model && harnessKey(q) === harnessKey(p))
-        .sort((a, b) => rank(a.settings || {}) - rank(b.settings || {}) || a.cost - b.cost);
-      const dash = style.dash ? ` stroke-dasharray="${style.dash}"` : "";
-      if (rows.length > 1) s += `<polyline points="${rows.map(q => `${X(q.cost)},${Y(q.progress)}`).join(" ")}" fill="none" stroke="${color(p)}" stroke-width="1.5" opacity=".75"${dash}/>`;
+        .sort((a, b) => a.cost - b.cost || rank(a.settings || {}) - rank(b.settings || {}));
+      if (rows.length > 1) s += `<polyline points="${rows.map(q => `${X(q.cost)},${Y(q.progress)}`).join(" ")}" fill="none" stroke="${color(p)}" stroke-width="1.5" opacity=".75"/>`;
+    }
+    const runs = (p.scored_runs || []).filter(r => Number.isFinite(r.progress));
+    if (runs.length > 1) {
+      const c = color(p), x = X(p.cost), y = Y(p.progress), ys = runs.map(r => Y(r.progress));
+      if (Math.max(...ys) > Math.min(...ys)) s += rangeBar(x, Math.min(...ys), x, Math.max(...ys), c);
+      const xs = runs.filter(r => Number.isFinite(r.cost)).map(r => X(r.cost));
+      if (xs.length > 1 && Math.max(...xs) > Math.min(...xs)) s += rangeBar(Math.min(...xs), y, Math.max(...xs), y, c);
     }
     s += marker(style.shape, X(p.cost), Y(p.progress), color(p), i);
   });
@@ -246,9 +285,11 @@ $("chart").onmousemove = ev => {
   if (!hit) { tip.hidden = true; return; }
   const p = chartPoints[+hit.dataset.i];
   const box = $("chartWrap").getBoundingClientRect();
+  const spread = (p.scored_runs || []).map(r => r.progress).filter(Number.isFinite);
+  const range = spread.length > 1 ? ` [${Math.min(...spread).toFixed(2)}–${Math.max(...spread).toFixed(2)}]` : "";
   tip.innerHTML = `<b style="color:${color(p)}">${esc(p.model)}</b>` +
     `<div class="meta">${esc(p.producer_name || "unknown")} · ${esc(harnessName(p))} · ${esc(level(p.settings || {}))}</div>` +
-    `<div>${usd(p.cost)} · ${Number(p.progress).toFixed(3)}% · ${p.scored} run${p.scored === 1 ? "" : "s"}</div>`;
+    `<div>${usd(p.cost)} · ${Number(p.progress).toFixed(3)}%${range} · ${p.scored} run${p.scored === 1 ? "" : "s"}</div>`;
   tip.hidden = false;
   tip.style.left = Math.max(0, Math.min(ev.clientX - box.left + 12, box.width - 200)) + "px";
   tip.style.top = Math.max(0, ev.clientY - box.top + 12) + "px";
@@ -262,12 +303,19 @@ $("chart").onclick = ev => {
 };
 
 async function load() {
+  const seq = ++loadSeq;
   const value = $("budget").value;
-  const query = value ? "?budget=" + encodeURIComponent(value) : "";
-  const response = await fetch("/api/leaderboard" + query);
+  const query = new URLSearchParams({mode: currentMode});
+  if (value) query.set("budget", value);
+  const response = await fetch("/api/leaderboard?" + query);
   if (!response.ok) throw Error(`Request failed (${response.status})`);
   const data = await response.json();
+  if (seq !== loadSeq) return;
   $("pollError").textContent = "";
+  currentMode = data.mode || currentMode;
+  localStorage.celestebenchMode = currentMode;
+  renderModeSwitch(data.modes || []);
+  $("benchmarkVersion").textContent = data.version ? "CelesteBench v" + data.version : "";
   const select = $("budget");
   const budgets = Array.isArray(data.budgets) ? data.budgets : [];
   $("budgetControl").style.display = budgets.length ? "" : "none";
@@ -290,30 +338,56 @@ async function load() {
   saveHidden();
 
   $("leaderboardControls").hidden = !available.length;
-  buildSelector(all);
+  buildSelector();
   renderChart();
   renderTable();
 }
 
+const shortRun = name => String(name).replace(/\/rollout$/, "").split("/").pop();
+
 function renderTable() {
-  const shown = scoredRows.filter(row => selectedHarnesses.has(harnessKey(row)));
+  const shown = scoredRows.filter(row => selectedModels.has(row.model) && selectedHarnesses.has(harnessKey(row)));
   if (!shown.length) { $("leaderboard").textContent = "no scores"; return; }
   $("leaderboard").innerHTML = `<table><thead><tr><th>model</th><th>settings</th><th>cost</th><th>progress</th><th>runs</th></tr></thead><tbody>` +
-    shown.map(row => {
+    shown.map((row, i) => {
       const s = row.settings || {};
       const summary = [harnessName(row), level(s), s.fps == null ? "paused" : `${s.fps} FPS`].filter(Boolean).join(" · ");
-      const limits = [s.max_frames == null ? null : `${s.max_frames} frames/action`,
-        s.max_actions == null ? null : `${s.max_actions} actions`].filter(Boolean).join(" · ");
+      const limits = s.max_frames == null ? "" : `${s.max_frames} frames/action`;
       const cost = Number.isFinite(row.cost) ? usd(row.cost) : "—";
       const links = row.scored_runs || [];
-      const name = links.length === 1
-        ? `<a href="/runs?run=${encodeURIComponent(links[0].name)}" title="${esc(links[0].name)}">${esc(row.model)}</a>`
-        : esc(row.model);
-      return `<tr><td>${logoHtml(row)}${name}</td><td class="meta" title="${esc(limits)}">${esc(summary)}</td><td>${cost}</td><td>${Number(row.progress).toFixed(3)}%</td><td>${row.scored}</td></tr>`;
+      const ids = links.map((_, j) => `runs-${i}-${j}`).join(" ");
+      const runCell = links.length > 1
+        ? `<button type="button" class="row-toggle" data-group="${i}" aria-expanded="false" aria-controls="${ids}">${logoHtml(row)}<span>${esc(row.model)}</span><span class="chev">▾</span></button>`
+        : `<a href="/runs?run=${encodeURIComponent(links[0].name)}" title="${esc(links[0].name)}">${logoHtml(row)}${esc(row.model)}</a>`;
+      // A model with several runs unfolds into one full row per run, each
+      // carrying the stat that varies run to run: its own cost and progress.
+      const details = links.length > 1 ? links.map((link, j) => `<tr class="run-detail" id="runs-${i}-${j}" data-group="${i}" hidden>` +
+        `<td class="run-name"><span class="run-indent">↳</span><a href="/runs?run=${encodeURIComponent(link.name)}" title="${esc(link.name)}">${esc(shortRun(link.name))}</a></td>` +
+        `<td class="meta" title="${esc(limits)}">${esc(summary)}</td>` +
+        `<td>${Number.isFinite(link.cost) ? usd(link.cost) : "—"}</td>` +
+        `<td>${Number(link.progress).toFixed(3)}%</td>` +
+        `<td class="meta">${j + 1}/${links.length}</td></tr>`).join("") : "";
+      return `<tr><td>${runCell}</td><td class="meta" title="${esc(limits)}">${esc(summary)}</td><td>${cost}</td><td>${Number(row.progress).toFixed(3)}%</td><td>${row.scored}</td></tr>${details}`;
     }).join("") + `</tbody></table>`;
 }
 
+$("leaderboard").onclick = ev => {
+  const button = ev.target.closest(".row-toggle");
+  if (!button) return;
+  const open = button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", String(open));
+  document.querySelectorAll(`#leaderboard .run-detail[data-group="${button.dataset.group}"]`)
+    .forEach(row => row.hidden = !open);
+};
+
 $("budget").onchange = () => load().catch(error => $("pollError").textContent = error.message);
+$("modeSwitch").onclick = event => {
+  const button = event.target.closest("button[data-mode]");
+  if (!button || button.dataset.mode === currentMode) return;
+  currentMode = button.dataset.mode;
+  $("budget").value = "";
+  load().catch(error => $("pollError").textContent = error.message);
+};
 const togglePanel = (button, panel, otherPanel, otherButton) => {
   panel.hidden = !panel.hidden;
   button.setAttribute("aria-expanded", String(!panel.hidden));

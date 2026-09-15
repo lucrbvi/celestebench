@@ -24,15 +24,15 @@ async def _select_action(call_id, arguments, signal=None, on_update=None):
     return AgentToolResult(content="Actions selected.")
 
 
-def _parse_play(calls, max_actions: int, max_frames: int) -> tuple[tuple[int | str, int], ...]:
+def _parse_play(calls, max_frames: int) -> tuple[tuple[int | str, int], ...]:
     if len(calls) != 1 or calls[0].name != "play":
         raise ValueError("model must call play exactly once")
     arguments = calls[0].arguments
     if set(arguments) != {"actions"}:
         raise ValueError("play requires exactly actions")
     actions = arguments["actions"]
-    if type(actions) is not list or not 1 <= len(actions) <= max_actions:
-        raise ValueError(f"play requires 1..{max_actions} actions")
+    if type(actions) is not list or not actions:
+        raise ValueError("play requires at least one action")
     for action in actions:
         if type(action) is not dict or set(action) not in ({"buttons", "frames"}, {"action", "frames"}):
             raise ValueError("each action must press buttons or wait")
@@ -49,14 +49,14 @@ def _parse_play(calls, max_actions: int, max_frames: int) -> tuple[tuple[int | s
 class TauPolicy:
     """One persistent Tau harness per rollout, retaining its full conversation."""
 
-    def __init__(self, provider, model: str, *, max_frames=30, max_actions=4,
+    def __init__(self, provider, model: str, *, max_frames=30,
                  max_images=3, trace=None, system=None, fps=None):
-        if type(max_frames) is not int or max_frames < 1 or type(max_actions) is not int or max_actions < 1:
-            raise ValueError("max_frames and max_actions must be positive")
+        if type(max_frames) is not int or max_frames < 1:
+            raise ValueError("max_frames must be a positive integer")
         if type(max_images) is not int or max_images < 1:
             raise ValueError("max_images must be a positive integer")
         self.provider, self.model = provider, model
-        self.max_frames, self.max_actions = max_frames, max_actions
+        self.max_frames = max_frames
         self.max_images = max_images
         self.trace = trace
         self.system = system if system is not None else system_prompt(
@@ -69,7 +69,7 @@ class TauPolicy:
                 "type": "object",
                 "properties": {
                     "actions": {
-                        "type": "array", "minItems": 1, "maxItems": max_actions,
+                        "type": "array", "minItems": 1,
                         "items": {
                             "oneOf": [{
                                 "type": "object",
@@ -198,7 +198,7 @@ class TauPolicy:
                             raise RuntimeError(message.error_message or f"Model stopped: {message.stop_reason}")
                         self._step += 1
                         try:
-                            actions = _parse_play(message.tool_calls, self.max_actions, self.max_frames)
+                            actions = _parse_play(message.tool_calls, self.max_frames)
                         except ValueError as error:
                             # BALROG-style fallback: feed back the invalidity,
                             # log it, release the buttons for one frame and play on.

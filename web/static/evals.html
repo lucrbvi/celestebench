@@ -15,6 +15,7 @@
         <div class="col">
           <div class="formgrid">
             <label>harness <select id="evalHarness"></select></label>
+            <label>mode <select id="evalMode"></select></label>
           </div>
           <div id="harnessFields"></div>
         </div>
@@ -27,7 +28,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-let evalJobs = [], polling = false, harnesses = {}, selected = null;
+let evalJobs = [], polling = false, harnesses = {}, modes = [], selected = null;
 const cards = new Map();
 
 async function jsonRequest(url, options = {}) {
@@ -41,7 +42,8 @@ function jobMeta(job) {
   const second = job.status === "queued" ? "waiting to start"
     : job.status === "running" && job.engine === false ? "harness booting — game clock has not started"
     : `${Number(job.elapsed).toFixed(1)}/${Number(job.timeout || 0).toFixed(0)}s · ${job.tokens == null ? "—" : job.tokens} tokens`;
-  return [`${job.decisions} decisions · ${job.frames} frames`, second];
+  const mode = job.mode ? `${String(job.mode).toUpperCase()} · ` : "";
+  return [`${job.decisions} decisions · ${job.frames} frames`, mode + second];
 }
 function updateMeta(card, job) {
   const [frames, detail] = jobMeta(job);
@@ -49,6 +51,13 @@ function updateMeta(card, job) {
   card.querySelector(".eval-detail").textContent = detail;
 }
 
+/* Each running card refreshes its own frame with short PNG requests, so any
+   number of live cards can fit in the browser's per-host connection budget. */
+function pollLive(img) {
+  if (!img.isConnected) return;
+  img.onload = img.onerror = () => setTimeout(() => pollLive(img), 200);
+  img.src = "/frame/" + encodeURIComponent(img.dataset.run) + "?t=" + Date.now();
+}
 function buildCard(job) {
   const card = document.createElement("div");
   card.className = "card";
@@ -59,11 +68,13 @@ function buildCard(job) {
     <div class="eval-status ${esc(job.status)}">${esc(job.status)}</div>
     <div class="meta"><span class="eval-frames"></span><br><span class="eval-detail"></span></div>
     ${["running", "completed"].includes(job.status) ? `<progress max="${job.timeout || job.elapsed || 1}" value="${job.elapsed}" aria-label="evaluation progress"></progress>` : ""}
-    ${job.status === "running" ? `<img class="eval-live" src="/live/${encodeURIComponent(job.name)}" alt="live game stream for ${esc(job.model)}">` : ""}
+    ${job.status === "running" ? `<img class="eval-live" data-run="${esc(job.name)}" alt="live game stream for ${esc(job.model)}">` : ""}
     ${job.error ? (job.error.length > 120
       ? `<details class="eval-error"><summary>${esc(job.error.slice(0, 120))}…</summary><pre>${esc(job.error)}</pre></details>`
       : `<div class="eval-error">${esc(job.error)}</div>`) : ""}`;
   updateMeta(card, job);
+  const live = card.querySelector(".eval-live");
+  if (live) setTimeout(() => pollLive(live), 0);
   if (job.status === "running" || job.status === "queued") {
     const stop = document.createElement("button");
     stop.textContent = "stop";
@@ -116,7 +127,7 @@ async function poll() {
     evalJobs = (await jsonRequest("/api/evals", {timeout: 10000})).filter(job => ["queued", "running"].includes(job.status));
     renderEvalJobs();
     updateEvalPlan();
-    $("pollError").textContent = "";
+    if ($("pollError").textContent.startsWith("Refresh failed:")) $("pollError").textContent = "";
   } catch (error) { $("pollError").textContent = `Refresh failed: ${error.message}`; }
   finally { polling = false; }
 }
@@ -144,7 +155,8 @@ function control(field, value) {
     if (value != null) input.value = value;
   } else {
     input = document.createElement("input");
-    input.type = field.kind === "int" || field.kind === "number" ? "number" : "text";
+    input.type = field.kind === "secret" ? "password"
+      : field.kind === "int" || field.kind === "number" ? "number" : "text";
     if (input.type === "number" && field.minimum != null) input.min = field.minimum;
     if (value != null) input.value = value;
     input.autocapitalize = "off"; input.spellcheck = false;
@@ -177,7 +189,8 @@ function applyWhen() {
   for (const label of document.querySelectorAll("#harnessFields label[data-when]")) {
     const [key, want] = JSON.parse(label.dataset.when);
     const source = document.querySelector(`#harnessFields [data-key="${key}"]`);
-    label.hidden = !source || source.value !== want;
+    const value = source && source.type === "checkbox" ? String(source.checked) : source && source.value;
+    label.hidden = !source || value !== want;
   }
 }
 function renderFields() {
@@ -290,7 +303,7 @@ async function submitEval(event) {
   event.preventDefault();
   const button = $("evalSubmit"), error = $("evalError");
   button.disabled = true; error.textContent = "";
-  const body = {harness: selected.key, evals: runRows()};
+  const body = {harness: selected.key, mode: $("evalMode").value, evals: runRows()};
   for (const input of document.querySelectorAll("#harnessFields [data-key]")) {
     if (input.closest("label").hidden) continue;
     const field = selected.options.find(item => item.key === input.dataset.key);
@@ -308,8 +321,9 @@ async function submitEval(event) {
 }
 async function loadHarnesses() {
   try {
-    for (const harness of await jsonRequest("/api/harnesses", {timeout: 10000}))
-      harnesses[harness.key] = harness;
+    const data = await jsonRequest("/api/harnesses", {timeout: 10000});
+    for (const harness of data.harnesses) harnesses[harness.key] = harness;
+    modes = data.modes;
     const select = $("evalHarness");
     select.replaceChildren(...Object.values(harnesses).map(harness => {
       const option = document.createElement("option");
@@ -317,6 +331,12 @@ async function loadHarnesses() {
       return option;
     }));
     select.value = "tau";
+    $("evalMode").replaceChildren(...modes.map(mode => {
+      const option = document.createElement("option");
+      option.value = mode.name; option.textContent = mode.label;
+      option.title = mode.description || "";
+      return option;
+    }));
     selectHarness();
   } catch (error) { $("pollError").textContent = `Could not load harnesses: ${error.message}`; }
 }

@@ -9,7 +9,6 @@ command line, trace schema) live in each script under examples/.
 
 import json
 import resource
-import socket
 import subprocess
 import sys
 import time
@@ -18,20 +17,36 @@ import urllib.request
 from pathlib import Path
 
 from . import BENCHMARK_VERSION
+from .modes import mode_of
 
 # The one task prompt the external harnesses send; the game rules ride in the
 # system prompt, so the user message adds nothing else.
 PROMPT = "Play Celeste Classic."
 
 
-def free_port():
-    """Bind and release a loopback port so parallel runs never share one."""
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+def port_file(output):
+    """Where this run's MCP server announces the port it bound."""
+    return Path(output) / "mcp.port"
 
 
-def wait_for_mcp(process, token, port, timeout=20):
+def wait_for_mcp(process, token, output, timeout=20):
+    """Wait for the server to bind its own port and answer requests, then return it.
+
+    The server binds the port itself and announces it through a file, so two
+    parallel runs can never race for the same port and the bearer token is only
+    ever sent to the process we launched.
+    """
+    announced = port_file(output)
+    deadline = time.monotonic() + timeout
+    port = None
+    while process.poll() is None and time.monotonic() < deadline:
+        try:
+            port = int(announced.read_text(encoding="utf-8"))
+            break
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    if port is None:
+        raise RuntimeError("this run's host MCP server did not become ready")
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/mcp",
         data=b"{}",
@@ -41,14 +56,13 @@ def wait_for_mcp(process, token, port, timeout=20):
             "Content-Type": "application/json",
         },
     )
-    deadline = time.monotonic() + timeout
     while process.poll() is None and time.monotonic() < deadline:
         try:
             urllib.request.urlopen(request, timeout=0.2).close()
-            return
+            return port
         except urllib.error.HTTPError as error:
             if error.code in (400, 406):
-                return
+                return port
         except (OSError, urllib.error.URLError):
             pass
         time.sleep(0.1)
@@ -88,13 +102,13 @@ def limit_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (67108864, 67108864))
 
 
-def mcp_command(output, *, port, timeout, frames=None, max_frames=30, max_images=3, fps=None):
+def mcp_command(output, *, timeout, frames=None, max_frames=30, max_images=3, fps=None):
     """Serve one bounded episode over HTTP for the CLI's MCP client."""
     command = [
         sys.executable, "-m", "celestebench.mcp",
         "--transport", "http",
         "--output", str(output),
-        "--port", str(port),
+        "--port-file", str(port_file(Path(output).parent)),
         "--timeout", str(timeout),
         "--max-frames", str(max_frames),
         "--max-images", str(max_images),
@@ -168,6 +182,7 @@ def run_config(model, timeout, frames, max_frames, fps, thinking_level, **extra)
     return {
         "model": model,
         "benchmark_version": BENCHMARK_VERSION,
+        "mode": mode_of(fps),
         "timeout": timeout,
         "frames": frames,
         "max_frames": max_frames,

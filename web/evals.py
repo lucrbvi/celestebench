@@ -16,7 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from celestebench import BENCHMARK_VERSION, auth
 from celestebench.harnesses import HARNESSES
+from celestebench.modes import MODES, mode_budgets
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "examples" / "llm.py"
@@ -102,14 +104,21 @@ def _harness_flags(harness, options):
     return flags
 
 
+def _budget_flags(options):
+    """The mode's budgets as command-line flags; a paused mode omits --fps."""
+    return [f"--{key.replace('_', '-')}={options[key]}"
+            for key in ("fps", "timeout", "max_frames", "max_images")
+            if options.get(key) is not None]
+
+
 def harness_catalog():
-    """Harness descriptors for the new-eval form, with dynamic choice lists."""
+    """Harness descriptors and the two modes for the new-eval form."""
     choices = []
     if _support_tau_ai() is not None:
         from celestebench import providers
         choices = [{"value": name, "label": name} for name in providers.provider_names()]
     choices.append({"value": "custom", "label": "custom endpoint"})
-    catalog = []
+    harnesses = []
     for harness in HARNESSES.values():
         entry = {"key": harness.key, "label": harness.label, "builtin": harness.builtin,
                  "note": harness.note, "run": [field.spec() for field in harness.run],
@@ -117,8 +126,9 @@ def harness_catalog():
         for field in entry["run"] + entry["options"]:
             field["choices"] = choices if field["source"] == "providers" else [
                 {"value": value, "label": value} for value in field["choices"]]
-        catalog.append(entry)
-    return catalog
+        harnesses.append(entry)
+    modes = [{"name": name, **settings} for name, settings in MODES.items()]
+    return {"harnesses": harnesses, "modes": modes}
 
 
 def _rows(path):
@@ -216,7 +226,7 @@ def _launch(job, options, secret):
     else:
         args = [sys.executable, str(ROOT / harness.script), *harness.command,
                 f"--output={job['_folder']}", f"--model={job['model']}"]
-        args += _harness_flags(harness, options)
+        args += _harness_flags(harness, options) + _budget_flags(options)
         env = os.environ.copy()
     job["status"], job["started_at"], job["error"] = "running", time.time(), None
     _write(job)
@@ -233,26 +243,48 @@ def _launch(job, options, secret):
     threading.Thread(target=_watch, args=(job, proc, secret), daemon=True).start()
 
 
+def _resource(job):
+    """The shared login a run must serialize on, or None when it can run at once.
+
+    A harness's cap applies to OAuth subscriptions (one shared session, per-account
+    limits); when `oauth_only` is set, API-key models are exempt and run in parallel.
+    """
+    harness = _harness(job.get("harness"))
+    if not harness.concurrency:
+        return None
+    model = job.get("model") or ""
+    if harness.oauth_only and not auth.oauth(harness.key, model):
+        return None
+    return (harness.key, auth.provider(harness.key, model))
+
+
+def _busy(resource):
+    return sum(1 for _id in _processes if _resource(_jobs[_id]) == resource)
+
+
 def _pump():
     """Start queued evaluations in submission order, up to each harness's cap."""
     with _lock:
         busy = {}
         for _id in _processes:
-            key = _harness(_jobs[_id].get("harness")).key
-            busy[key] = busy.get(key, 0) + 1
+            key = _resource(_jobs[_id])
+            if key is not None:
+                busy[key] = busy.get(key, 0) + 1
         for job in list(_jobs.values()):
             if job["status"] != "queued":
                 continue
             harness = _harness(job.get("harness"))
-            # Capped harnesses share a resource; wait for a free slot.
-            if harness.concurrency and busy.get(harness.key, 0) >= harness.concurrency:
+            # Capped harnesses share a login; wait for a free slot.
+            key = _resource(job)
+            if key is not None and busy.get(key, 0) >= harness.concurrency:
                 continue
             options, secret = job.pop("_options", None), job.pop("_secret", None)
             if options is None:
                 job.update(status="failed", error="Queued evaluation lost its settings.",
                            finished_at=time.time())
                 continue
-            busy[harness.key] = busy.get(harness.key, 0) + 1
+            if key is not None:
+                busy[key] = busy.get(key, 0) + 1
             _launch(job, options, secret)
 
 
@@ -315,17 +347,7 @@ def _provider_choices():
     return ", ".join((*providers.provider_names(), providers.CUSTOM))
 
 
-def _positive(payload, key, default, integer=False):
-    value = payload.get(key, default)
-    if (type(value) not in {int, float} or isinstance(value, bool)
-            or not math.isfinite(value) or value <= 0
-            or integer and type(value) is not int):
-        raise ValueError("timeout must be a positive number of seconds." if key == "timeout"
-                         else f"Invalid {key} budget.")
-    return value
-
-
-def _enqueue(runs, harness, plans):
+def _enqueue(runs, harness, plans, mode):
     runs = Path(runs).resolve()
     with _lock:
         stamp = datetime.now(UTC).strftime("%Y-%m-%d-%H-%M-%S")
@@ -339,16 +361,16 @@ def _enqueue(runs, harness, plans):
             meta.parent.mkdir(parents=True, exist_ok=True)
             folder.parent.mkdir(parents=True, exist_ok=True)
             job = {"id": job_id, "name": name, "model": model, "harness": harness,
-                   "provider": entry_options.get("provider"), "status": "queued", "error": None,
+                   "mode": mode, "provider": entry_options.get("provider"),
+                   "benchmark_version": BENCHMARK_VERSION,
+                   "status": "queued", "error": None,
                    "decisions": 0, "timeout": entry_options["timeout"], "frames": 0,
                    "elapsed": 0, "tokens": None, "started_at": time.time(),
                    "_folder": str(folder), "_meta": str(meta)}
             # Options and the secret stay in memory only; never persisted to disk.
-            # Capped harnesses queue once their share of the resource is running.
-            limit = HARNESSES[harness].concurrency
-            running = sum(1 for _id in _processes
-                          if _harness(_jobs[_id].get("harness")).key == harness)
-            if limit and running >= limit:
+            # A run queues only when its shared login is already saturated.
+            resource = _resource(job)
+            if resource is not None and _busy(resource) >= HARNESSES[harness].concurrency:
                 job["_options"], job["_secret"] = entry_options, secret
                 _write(job)
             else:
@@ -376,11 +398,11 @@ def start_eval(payload, runs):
 def _tau_jobs(harness, payload, runs):
     if _support_tau_ai() is None:
         raise RuntimeError("Install LLM support: uv sync --extra llm; then restart the viewer.")
-    defaults = {"timeout": 120, "max_frames": 30, "max_actions": 4, "max_images": 3}
-    allowed = set(defaults) | {"harness", "evals", "model", "models", "provider",
-                               "base_url", "api_key", "fps", "thinking_level"}
+    allowed = {"harness", "evals", "model", "models", "provider",
+               "base_url", "api_key", "thinking_level", "mode"}
     if set(payload) - allowed:
         raise ValueError("Unknown evaluation settings.")
+    mode_name, mode = mode_budgets(payload.get("mode") or "rtc")
     rows = _run_rows(payload, harness)
     provider = payload.get("provider", "opencode-go")
     base_url = payload.get("base_url")
@@ -401,22 +423,15 @@ def _tau_jobs(harness, payload, runs):
     if not isinstance(secret, str) or not secret or "\0" in secret:
         raise ValueError(f"Enter an API key or set {key_env_name} before starting the viewer.")
     options = {"provider": provider, "thinking_level": _thinking_level(
-        payload.get("thinking_level", "low"))}
+        payload.get("thinking_level", "low")), **mode}
     if base_url is not None:
         options["base_url"] = base_url
-    for key, integer in (("max_frames", True), ("max_actions", True), ("max_images", True),
-                         ("timeout", False)):
-        options[key] = _positive(payload, key, defaults[key], integer=integer)
-    if payload.get("fps") is not None:
-        options["fps"] = _positive(payload, "fps", 1)
 
     # Resolve every run's endpoint and key before touching the filesystem.
     plans = []
     for row in rows:
         model, override = row["model"], row.get("tag")
         entry_options, entry_secret = dict(options), secret
-        if row.get("timeout") is not None:
-            entry_options["timeout"] = _positive(row, "timeout", entry_options["timeout"])
         if row.get("thinking_level") is not None:
             entry_options["thinking_level"] = _thinking_level(row["thinking_level"])
         if override is not None and override != provider:
@@ -426,15 +441,16 @@ def _tau_jobs(harness, payload, runs):
             if not entry_secret:
                 raise ValueError(f"Set {_provider_env(override)} to launch {model} on {override}.")
         plans.append((model, entry_options, entry_secret))
-    return _enqueue(runs, harness.key, plans)
+    return _enqueue(runs, harness.key, plans, mode_name)
 
 
 def _external_jobs(harness, payload, runs):
-    allowed = {"harness", "evals", "model", "models"} | {
+    allowed = {"harness", "evals", "model", "models", "mode"} | {
         field.key for field in (*harness.run, *harness.options)}
     if set(payload) - allowed:
         raise ValueError(f"Unknown {harness.label} evaluation settings.")
     _require(harness)
+    mode_name, mode = mode_budgets(payload.get("mode") or "rtc")
     options = {field.key: _field_value(field, payload.get(field.key, field.default))
                for field in harness.options}
     # Top-level run fields are shared defaults; each row may override them.
@@ -444,12 +460,13 @@ def _external_jobs(harness, payload, runs):
     rows = _run_rows(payload, harness)
     plans = []
     for row in rows:
-        entry_options = options | {key: value for key, value in defaults.items() if value is not None}
+        entry_options = (options | {key: value for key, value in defaults.items() if value is not None}
+                         | mode)
         for field in harness.run:
             if field.key != "model" and row.get(field.key) is not None:
                 entry_options[field.key] = _field_value(field, row[field.key])
         plans.append((row["model"], entry_options, None))
-    return _enqueue(runs, harness.key, plans)
+    return _enqueue(runs, harness.key, plans, mode_name)
 
 
 def job_running(job_id):

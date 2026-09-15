@@ -2,14 +2,17 @@
 
 import importlib.util
 import json
-import tempfile
 import threading
 import time
-import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from web import evals
+
+pytestmark = pytest.mark.skipif(not importlib.util.find_spec("tau_ai"),
+                                reason="LLM extra is not installed")
 
 
 class LocalAPI(BaseHTTPRequestHandler):
@@ -55,97 +58,104 @@ class LocalAPI(BaseHTTPRequestHandler):
         pass
 
 
-@unittest.skipUnless(importlib.util.find_spec("tau_ai"), "LLM extra is not installed")
-class EvalIntegrationTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.runs = Path(self.directory.name)
-        self.api = ThreadingHTTPServer(("127.0.0.1", 0), LocalAPI)
-        self.api.requests = []
-        self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
-        self.thread.start()
-
-    def tearDown(self):
-        for job in evals.list_evals(self.runs):
+@pytest.fixture
+def local_api(tmp_path):
+    api = ThreadingHTTPServer(("127.0.0.1", 0), LocalAPI)
+    api.requests = []
+    thread = threading.Thread(target=api.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield tmp_path, api
+    finally:
+        for job in evals.list_evals(tmp_path):
             if job["status"] in {"running", "queued"}:
                 evals.stop_eval(job["id"])
-        self.api.shutdown()
-        self.api.server_close()
-        self.thread.join()
-        self.directory.cleanup()
+        api.shutdown()
+        api.server_close()
+        thread.join()
 
-    def launch(self, model, timeout=60, **settings):
-        payload = {"model": model, "provider": settings.pop("provider", "custom"),
-                   "timeout": timeout,
-                   "base_url": f"http://127.0.0.1:{self.api.server_port}/v1",
-                   "api_key": "local-test-key", **settings}
-        return evals.start_eval(payload, self.runs)[0]
 
-    def wait_for(self, predicate):
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            time.sleep(0.05)
-        self.fail("Timed out waiting for the local evaluation")
+def launch(api, runs, model, timeout=60, **settings):
+    payload = {"model": model, "provider": settings.pop("provider", "custom"),
+               "base_url": f"http://127.0.0.1:{api.server_port}/v1",
+               "api_key": "local-test-key", **settings}
+    payload.setdefault("mode", "rtc")
+    # The modes pin the wall-clock budget; keep the test's short deadlines.
+    mode = {**evals.MODES[payload["mode"]], "timeout": timeout}
+    with patch.dict(evals.MODES, {payload["mode"]: mode}):
+        return evals.start_eval(payload, runs)[0]
 
-    def test_real_cli_writes_progress_history_and_video(self):
-        job = self.launch("local-test", timeout=4)
-        self.wait_for(lambda: (self.runs / job["name"] / "live.png").is_file())
-        self.wait_for(lambda: evals.list_evals(self.runs)[0]["status"] != "running")
-        final = evals.list_evals(self.runs)[0]
-        self.assertEqual(final["status"], "completed", final["error"])
-        self.assertGreaterEqual(final["decisions"], 1)
-        self.assertGreater(final["frames"], 0)
-        self.assertGreaterEqual(final["tokens"], 20 * (final["decisions"] - 1))
-        folder = self.runs / job["name"]
-        self.assertEqual(len(list((folder / "screenshots").glob("*.png"))), final["decisions"])
-        self.assertTrue((folder / "rollout.mp4").stat().st_size)
-        self.assertEqual(len(self.api.requests), final["decisions"])
-        self.assertGreater(len(self.api.requests[-1]["messages"]), len(self.api.requests[0]["messages"]))
-        config = json.loads((folder / "config.json").read_text())
-        self.assertEqual(self.api.requests[0]["messages"][0]["role"], "system")
-        self.assertEqual(self.api.requests[0]["messages"][0]["content"], config["system"])
-        self.assertNotIn("local-test-key", json.dumps(config))
-        elapsed = final["elapsed"]
-        self.assertEqual(evals.list_evals(self.runs)[0]["elapsed"], elapsed)
 
-    def test_responses_request_contains_persisted_system_prompt(self):
-        job = self.launch("local-responses", timeout=4, provider="openai", fps=12,
-                          max_frames=7, max_actions=2, max_images=2)
-        self.wait_for(lambda: job["id"] not in evals._processes)
-        final = next(item for item in evals.list_evals(self.runs) if item["id"] == job["id"])
-        self.assertEqual(final["status"], "completed", final["error"])
-        self.assertTrue(self.api.requests)
-        request = self.api.requests[0]
-        self.assertEqual(request["model"], "local-responses")
-        instructions = request["instructions"]
-        self.assertIsInstance(instructions, str)
-        self.assertTrue(instructions)
-        self.assertIn("This episode is RTC at 12 fps", instructions)
-        self.assertIn("Frames must be integers from 1 to 7", instructions)
-        self.assertIn("up to 2 sampled frames", instructions)
-        self.assertEqual(request["tools"][0]["parameters"]["properties"]["actions"]["maxItems"], 2)
+def wait_for(predicate):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    pytest.fail("Timed out waiting for the local evaluation")
 
-        config = json.loads((self.runs / final["name"] / "config.json").read_text())
-        self.assertEqual(config["system"], instructions)
-        self.assertTrue(config["system_prompt_sent"])
-        self.assertEqual(config["fps"], 12)
-        self.assertEqual(config["max_frames"], 7)
-        self.assertEqual(config["max_actions"], 2)
-        self.assertEqual(config["max_images"], 2)
 
-    def test_cancel_keeps_partial_run_and_failure_is_visible(self):
-        job = self.launch("local-slow")
-        self.wait_for(lambda: bool(self.api.requests))
-        stopped = evals.stop_eval(job["id"])
-        self.assertEqual(stopped["status"], "cancelled")
-        self.wait_for(lambda: job["id"] not in evals._processes)
-        self.assertTrue((self.runs / job["name"] / "checkpoint.state").is_file())
-        failed = self.launch("local-failure")
-        self.wait_for(lambda: failed["id"] not in evals._processes)
-        final = next(job for job in evals.list_evals(self.runs) if job["id"] == failed["id"])
-        self.assertEqual(final["status"], "failed")
-        self.assertIn("Invalid model", final["error"])
-        self.assertNotIn("local-test-key", final["error"])
-        self.assertNotIn("local-test-key", (self.runs / failed["name"] / "messages.jsonl").read_text())
+def test_real_cli_writes_progress_history_and_video(local_api):
+    runs, api = local_api
+    job = launch(api, runs, "local-test", timeout=4)
+    wait_for(lambda: (runs / job["name"] / "live.png").is_file())
+    wait_for(lambda: evals.list_evals(runs)[0]["status"] != "running")
+    final = evals.list_evals(runs)[0]
+    assert final["status"] == "completed", final["error"]
+    assert final["decisions"] >= 1
+    assert final["frames"] > 0
+    assert final["tokens"] >= 20 * (final["decisions"] - 1)
+    folder = runs / job["name"]
+    assert len(list((folder / "screenshots").glob("*.png"))) == final["decisions"]
+    assert (folder / "rollout.mp4").stat().st_size
+    assert len(api.requests) == final["decisions"]
+    assert len(api.requests[-1]["messages"]) > len(api.requests[0]["messages"])
+    config = json.loads((folder / "config.json").read_text())
+    assert api.requests[0]["messages"][0]["role"] == "system"
+    assert api.requests[0]["messages"][0]["content"] == config["system"]
+    assert "local-test-key" not in json.dumps(config)
+    elapsed = final["elapsed"]
+    assert evals.list_evals(runs)[0]["elapsed"] == elapsed
+
+
+def test_responses_request_contains_persisted_system_prompt(local_api):
+    runs, api = local_api
+    custom = {**evals.MODES["rtc"], "fps": 12, "max_frames": 7, "max_images": 2}
+    with patch.dict(evals.MODES, {"test": custom}):
+        job = launch(api, runs, "local-responses", timeout=4, provider="openai", mode="test")
+    wait_for(lambda: job["id"] not in evals._processes)
+    final = next(item for item in evals.list_evals(runs) if item["id"] == job["id"])
+    assert final["status"] == "completed", final["error"]
+    assert api.requests
+    request = api.requests[0]
+    assert request["model"] == "local-responses"
+    instructions = request["instructions"]
+    assert isinstance(instructions, str)
+    assert instructions
+    assert "This episode is RTC at 12 fps" in instructions
+    assert "Frames must be integers from 1 to 7" in instructions
+    assert "up to 2 sampled frames" in instructions
+
+    config = json.loads((runs / final["name"] / "config.json").read_text())
+    assert config["system"] == instructions
+    assert config["system_prompt_sent"]
+    assert config["fps"] == 12
+    assert config["max_frames"] == 7
+    assert config["max_images"] == 2
+
+
+def test_cancel_keeps_partial_run_and_failure_is_visible(local_api):
+    runs, api = local_api
+    job = launch(api, runs, "local-slow")
+    wait_for(lambda: bool(api.requests))
+    stopped = evals.stop_eval(job["id"])
+    assert stopped["status"] == "cancelled"
+    wait_for(lambda: job["id"] not in evals._processes)
+    assert (runs / job["name"] / "checkpoint.state").is_file()
+    failed = launch(api, runs, "local-failure")
+    wait_for(lambda: failed["id"] not in evals._processes)
+    final = next(job for job in evals.list_evals(runs) if job["id"] == failed["id"])
+    assert final["status"] == "failed"
+    assert "Invalid model" in final["error"]
+    assert "local-test-key" not in final["error"]
+    assert "local-test-key" not in (runs / failed["name"] / "messages.jsonl").read_text()
