@@ -1,11 +1,12 @@
 import asyncio
-import functools
 import json
 from pathlib import Path
 
 import httpx
 import numpy as np
 import pytest
+
+from conftest import asyncio_test
 
 pytest.importorskip("mcp.shared.memory")
 
@@ -23,14 +24,6 @@ async def fake_rollout(policy, output, **options):
     second = np.ones((2, 2, 4), dtype=np.uint8)
     await policy((first, second))
     return {"frames": 3, "decisions": 1, "actions": len(actions), "elapsed": 0.01}
-
-
-def asyncio_test(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        return asyncio.run(fn(*args, **kwargs))
-
-    return wrapper
 
 
 def test_strict_actions():

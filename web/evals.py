@@ -21,7 +21,6 @@ from celestebench.harnesses import HARNESSES
 from celestebench.modes import MODES, mode_budgets
 
 ROOT = Path(__file__).resolve().parent.parent
-CLI = ROOT / "examples" / "llm.py"
 
 
 _lock = threading.RLock()
@@ -50,6 +49,7 @@ def _harness(name):
 
 _REQUIREMENTS = {
     "codex": lambda: shutil.which("codex") is not None,
+    "claude": lambda: shutil.which("claude") is not None,
     "opencode": lambda: shutil.which("opencode") is not None,
     "pi": lambda: shutil.which("pi") is not None,
 }
@@ -219,12 +219,13 @@ def _launch(job, options, secret):
     """Spawn the harness subprocess. Caller holds the lock; job becomes running."""
     harness = _harness(job["harness"])
     if harness.builtin:
-        args = [sys.executable, str(CLI), f"--output={job['_folder']}", f"--model={job['model']}"]
+        args = [sys.executable, str(ROOT / harness.script),
+                f"--output={job['_folder']}", f"--model={job['model']}"]
         args += [f"--{key.replace('_', '-')}={value}" for key, value in options.items()]
         env = os.environ.copy()
         env["CELESTEBENCH_API_KEY"] = secret
     else:
-        args = [sys.executable, str(ROOT / harness.script), *harness.command,
+        args = [sys.executable, str(ROOT / harness.script),
                 f"--output={job['_folder']}", f"--model={job['model']}"]
         args += _harness_flags(harness, options) + _budget_flags(options)
         env = os.environ.copy()

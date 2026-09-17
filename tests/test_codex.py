@@ -1,14 +1,12 @@
-import importlib.util
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-PATH = Path(__file__).parents[1] / "examples" / "codex.py"
-spec = importlib.util.spec_from_file_location("codex", PATH)
-codex = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(codex)
+from conftest import load_example
+
+codex = load_example("codex")
 
 
 def test_profile_locks_the_shell_to_the_workspace():
@@ -36,8 +34,8 @@ def test_reasoning_effort_maps_tau_thinking_levels():
 
 def test_run_jails_codex_and_keeps_secrets_out_of_argv():
     with (
-        patch.object(codex, "_stop_mcp") as stop,
-        patch.object(codex, "wait_for_mcp") as ready,
+        patch.object(codex.harness, "stop_mcp") as stop,
+        patch.object(codex.harness, "wait_for_mcp") as ready,
         patch.object(codex.secrets, "token_urlsafe", return_value="generated-token"),
         patch.object(codex.subprocess, "Popen") as popen,
         patch.object(codex.subprocess, "run") as run,
@@ -92,8 +90,8 @@ def test_run_jails_codex_and_keeps_secrets_out_of_argv():
 
 def test_run_without_a_key_uses_the_chatgpt_login():
     with (
-        patch.object(codex, "_stop_mcp"),
-        patch.object(codex, "wait_for_mcp") as ready,
+        patch.object(codex.harness, "stop_mcp"),
+        patch.object(codex.harness, "wait_for_mcp") as ready,
         patch.object(codex, "oauth_login") as login,
         patch.object(codex.secrets, "token_urlsafe", return_value="token"),
         patch.object(codex.subprocess, "Popen") as popen,
@@ -126,8 +124,8 @@ def test_run_without_a_key_uses_the_chatgpt_login():
 
 def test_codex_failure_reports_its_own_stderr():
     with (
-        patch.object(codex, "_stop_mcp"),
-        patch.object(codex, "wait_for_mcp") as ready,
+        patch.object(codex.harness, "stop_mcp"),
+        patch.object(codex.harness, "wait_for_mcp") as ready,
         patch.object(codex, "oauth_login") as login,
         patch.object(codex.secrets, "token_urlsafe", return_value="token"),
         patch.object(codex.subprocess, "Popen") as popen,
@@ -162,8 +160,8 @@ def test_run_without_a_key_or_login_refuses():
 
 def test_mcp_start_failure_still_cleans_up():
     with (
-        patch.object(codex, "_stop_mcp") as stop,
-        patch.object(codex, "wait_for_mcp", side_effect=RuntimeError("collision")),
+        patch.object(codex.harness, "stop_mcp") as stop,
+        patch.object(codex.harness, "wait_for_mcp", side_effect=RuntimeError("collision")),
         patch.object(codex.secrets, "token_urlsafe", return_value="token"),
         patch.object(codex.subprocess, "Popen") as popen,
     ):
@@ -176,13 +174,3 @@ def test_mcp_start_failure_still_cleans_up():
         ):
             codex.run("prompt", None, Path(root) / "out", 2, None)
         stop.assert_called_once_with(process, Path(root) / "out" / "rollout", 2)
-
-
-def test_stop_mcp_delegates_and_lets_the_episode_finalize():
-    with patch.object(codex, "stop_process") as stop:
-        process = MagicMock()
-        process.poll.return_value = None
-        with tempfile.TemporaryDirectory() as root:
-            rollout = Path(root) / "rollout"  # no config.json: skip the wait
-            codex._stop_mcp(process, rollout, timeout=1)
-        stop.assert_called_once_with(process)

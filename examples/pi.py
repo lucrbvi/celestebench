@@ -8,30 +8,21 @@ the host's settings, trust list, extensions and skills never reach it. Pi's
 for Tau runs.
 """
 
-import argparse
 import json
 import os
 import secrets
 import subprocess
 from pathlib import Path
 
-from celestebench import harness
+from celestebench import auth, harness
 from celestebench.prompt import system_prompt
 
 EXTENSION = Path(__file__).with_name("pi_celeste.ts")
 
-stop_process = harness.stop_process
-wait_for_mcp = harness.wait_for_mcp
-limit_output = harness.limit_output
-
-
-def _stop_mcp(process, rollout, timeout=0):
-    harness.stop_mcp(process, rollout, timeout, stop=stop_process)
-
 
 def host_agent_dir():
     """The host Pi agent directory whose login and model catalog we borrow."""
-    return Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
+    return auth.agent_dir("pi")
 
 
 def isolated_home(output):
@@ -141,7 +132,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
                             max_frames=max_frames, max_images=max_images, fps=fps),
         env=env, start_new_session=True)
     try:
-        port = wait_for_mcp(mcp, token, output)
+        port = harness.wait_for_mcp(mcp, token, output)
         env["CELESTEBENCH_MCP_URL"] = f"http://127.0.0.1:{port}/mcp"
         command = [
             "pi", "--print", "--mode", "json", "--no-session", "--no-extensions",
@@ -156,7 +147,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
         with trace_path.open("xb") as trace:
             completed = subprocess.run(
                 command, cwd=workspace, env=env, text=True, stdout=trace,
-                timeout=timeout + 30, preexec_fn=limit_output, check=False)
+                timeout=timeout + 30, preexec_fn=harness.limit_output, check=False)
         error = cli_error(trace_path)
         if completed.returncode != 0 or error:
             harness.fail(trace_path, error or f"Pi exited with code {completed.returncode}")
@@ -164,31 +155,11 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
         if not (rollout / "config.json").is_file():
             harness.fail(trace_path, "Pi finished without using the game tools")
     finally:
-        _stop_mcp(mcp, rollout, timeout)
+        harness.stop_mcp(mcp, rollout, timeout)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", default=harness.PROMPT)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--frames", type=int)
-    parser.add_argument("--max-frames", type=int, default=30)
-    parser.add_argument("--max-images", type=int, default=3)
-    parser.add_argument("--thinking-level")
-    parser.add_argument("--fps", type=float)
-    args = parser.parse_args()
-    if (
-        args.timeout <= 0
-        or args.frames is not None
-        and args.frames <= 0
-        or args.max_frames <= 0
-        or args.max_images <= 0
-        or args.fps is not None
-        and args.fps <= 0
-    ):
-        parser.error("timeout, frames, max-frames, max-images, and fps must be positive")
+    args = harness.cli_args(__doc__)
     run(args.prompt, args.model, args.output, args.timeout, args.fps, args.frames,
         args.max_frames, args.thinking_level, args.max_images)
 

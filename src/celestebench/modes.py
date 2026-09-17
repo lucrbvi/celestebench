@@ -6,7 +6,6 @@ from pathlib import Path
 MODES = json.loads((Path(__file__).resolve().parents[2] / "modes.json").read_text(encoding="utf-8"))
 # Only these keys reach the harnesses; label and description are viewer metadata.
 BUDGETS = ("timeout", "fps", "max_frames", "max_images")
-DEFAULT = "rtc"
 
 
 def mode_budgets(name: str) -> tuple[str, dict]:

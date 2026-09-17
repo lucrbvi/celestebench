@@ -1,13 +1,11 @@
-import importlib.util
 import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-PATH = Path(__file__).parents[1] / "examples" / "pi.py"
-spec = importlib.util.spec_from_file_location("pi", PATH)
-pi = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pi)
+from conftest import load_example
+
+pi = load_example("pi")
 
 
 def test_normalize_emits_one_assistant_row_per_completed_play():
@@ -94,8 +92,8 @@ def test_run_loads_the_bundled_extension_without_builtin_tools():
         patch.object(pi.subprocess, "run") as run,
         patch.object(pi.subprocess, "Popen") as popen,
         patch.object(pi.secrets, "token_urlsafe", return_value="generated-token"),
-        patch.object(pi, "wait_for_mcp") as ready,
-        patch.object(pi, "_stop_mcp") as stop,
+        patch.object(pi.harness, "wait_for_mcp") as ready,
+        patch.object(pi.harness, "stop_mcp") as stop,
         patch.object(pi, "host_agent_dir") as agent_dir,
     ):
         process = MagicMock()

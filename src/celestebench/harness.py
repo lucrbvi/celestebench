@@ -7,6 +7,7 @@ messages.jsonl the viewer already reads. Only the CLI-specific parts (config,
 command line, trace schema) live in each script under examples/.
 """
 
+import argparse
 import json
 import resource
 import subprocess
@@ -176,6 +177,26 @@ def fail(trace, message):
     with Path(trace).open("a", encoding="utf-8") as file:
         file.write(json.dumps({"type": "error", "message": message}) + "\n")
     raise SystemExit(message)
+
+
+def cli_args(description, model_required=True):
+    """Parse and validate the budget flags every external harness shares."""
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--prompt", default=PROMPT)
+    parser.add_argument("--model", required=model_required)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--frames", type=int)
+    parser.add_argument("--max-frames", type=int, default=30)
+    parser.add_argument("--max-images", type=int, default=3)
+    parser.add_argument("--thinking-level")
+    parser.add_argument("--fps", type=float)
+    args = parser.parse_args()
+    if (args.timeout <= 0 or args.frames is not None and args.frames <= 0
+            or args.max_frames <= 0 or args.max_images <= 0
+            or args.fps is not None and args.fps <= 0):
+        parser.error("timeout, frames, max-frames, max-images, and fps must be positive")
+    return args
 
 
 def run_config(model, timeout, frames, max_frames, fps, thinking_level, **extra):

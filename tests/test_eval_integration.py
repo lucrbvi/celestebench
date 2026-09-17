@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import wait_until
 from web import evals
 
 pytestmark = pytest.mark.skipif(not importlib.util.find_spec("tau_ai"),
@@ -86,20 +87,11 @@ def launch(api, runs, model, timeout=60, **settings):
         return evals.start_eval(payload, runs)[0]
 
 
-def wait_for(predicate):
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.05)
-    pytest.fail("Timed out waiting for the local evaluation")
-
-
 def test_real_cli_writes_progress_history_and_video(local_api):
     runs, api = local_api
     job = launch(api, runs, "local-test", timeout=4)
-    wait_for(lambda: (runs / job["name"] / "live.png").is_file())
-    wait_for(lambda: evals.list_evals(runs)[0]["status"] != "running")
+    wait_until(lambda: (runs / job["name"] / "live.png").is_file(), timeout=15, interval=0.05)
+    wait_until(lambda: evals.list_evals(runs)[0]["status"] != "running", timeout=15, interval=0.05)
     final = evals.list_evals(runs)[0]
     assert final["status"] == "completed", final["error"]
     assert final["decisions"] >= 1
@@ -123,7 +115,7 @@ def test_responses_request_contains_persisted_system_prompt(local_api):
     custom = {**evals.MODES["rtc"], "fps": 12, "max_frames": 7, "max_images": 2}
     with patch.dict(evals.MODES, {"test": custom}):
         job = launch(api, runs, "local-responses", timeout=4, provider="openai", mode="test")
-    wait_for(lambda: job["id"] not in evals._processes)
+    wait_until(lambda: job["id"] not in evals._processes, timeout=15, interval=0.05)
     final = next(item for item in evals.list_evals(runs) if item["id"] == job["id"])
     assert final["status"] == "completed", final["error"]
     assert api.requests
@@ -147,13 +139,13 @@ def test_responses_request_contains_persisted_system_prompt(local_api):
 def test_cancel_keeps_partial_run_and_failure_is_visible(local_api):
     runs, api = local_api
     job = launch(api, runs, "local-slow")
-    wait_for(lambda: bool(api.requests))
+    wait_until(lambda: bool(api.requests), timeout=15, interval=0.05)
     stopped = evals.stop_eval(job["id"])
     assert stopped["status"] == "cancelled"
-    wait_for(lambda: job["id"] not in evals._processes)
+    wait_until(lambda: job["id"] not in evals._processes, timeout=15, interval=0.05)
     assert (runs / job["name"] / "checkpoint.state").is_file()
     failed = launch(api, runs, "local-failure")
-    wait_for(lambda: failed["id"] not in evals._processes)
+    wait_until(lambda: failed["id"] not in evals._processes, timeout=15, interval=0.05)
     final = next(job for job in evals.list_evals(runs) if job["id"] == failed["id"])
     assert final["status"] == "failed"
     assert "Invalid model" in final["error"]

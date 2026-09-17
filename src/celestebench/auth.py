@@ -10,7 +10,8 @@ import os
 from pathlib import Path
 
 
-def _agent_dir(harness: str) -> Path | None:
+def agent_dir(harness: str) -> Path | None:
+    """The CLI's host state directory, where its login and settings live."""
     if harness == "opencode":
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
         return base / "opencode"
@@ -20,7 +21,7 @@ def _agent_dir(harness: str) -> Path | None:
 
 
 def _read(harness: str, name: str):
-    directory = _agent_dir(harness)
+    directory = agent_dir(harness)
     if directory is None:
         return {}
     try:

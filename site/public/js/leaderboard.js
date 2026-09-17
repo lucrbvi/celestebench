@@ -1,34 +1,3 @@
-<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>leaderboard · celestebench</title><link rel="stylesheet" href="/viewer.css"></head>
-<body>
-<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/runs">runs</a><a href="/evals">evaluations</a><a href="/leaderboard" aria-current="page">leaderboard</a></nav></header>
-<main id="leaderboardPage"><section><h2>leaderboard <span id="benchmarkVersion" class="meta"></span></h2>
-<div id="modeSwitch" class="modeswitch" role="group" aria-label="benchmark mode">
-  <button type="button" data-mode="rtc">RTC</button>
-  <button type="button" data-mode="lite">Lite</button>
-</div>
-<label id="budgetControl">budget <select id="budget" aria-label="wall-clock budget"></select></label>
-<div id="leaderboardControls" hidden>
-  <div class="selector">
-    <button id="selectorToggle" type="button" aria-expanded="false">0 of 0 models</button>
-    <div id="selectorPanel" class="selector-panel" hidden>
-      <div class="selector-actions"><button id="selectAll" type="button">all</button><button id="selectNone" type="button">none</button></div>
-      <div id="selectorList"></div>
-    </div>
-  </div>
-  <div class="selector">
-    <button id="harnessToggle" type="button" aria-expanded="false">0 of 0 harnesses</button>
-    <div id="harnessPanel" class="selector-panel" hidden>
-      <div class="selector-actions"><button id="harnessSelectAll" type="button">all</button><button id="harnessSelectNone" type="button">none</button></div>
-      <div id="harnessList"></div>
-    </div>
-  </div>
-</div>
-<div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
-<div id="chartEmpty" class="meta" hidden>no cost data</div>
-<div id="leaderboard" class="table-wrap">loading…</div>
-</section></main>
-<script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 const LAB_COLORS = {
@@ -87,9 +56,10 @@ const rank = s => RANK[String(s.thinking_level || s.reasoning_effort || "").toLo
 const shortModel = m => String(m).replace(/^.*\//, "");
 const readSaved = () => { try { return JSON.parse(localStorage.celestebenchHiddenModels || "null"); } catch { return null; } };
 const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celestebenchHiddenHarnesses || "null"); } catch { return null; } };
+let data = null;
 let plottable = [], selectedModels = new Set(), selectedHarnesses = new Set(), scoredRows = [], chartPoints = [];
 let currentMode = localStorage.celestebenchMode || "rtc";
-let loadSeq = 0;
+let budget = "";
 function renderModeSwitch(modes) {
   $("modeSwitch").querySelectorAll("button").forEach(button => {
     button.hidden = modes.length > 0 && !modes.includes(button.dataset.mode);
@@ -305,47 +275,6 @@ $("chart").onclick = ev => {
   if (runs.length === 1) location.href = "/runs?run=" + encodeURIComponent(runs[0].name);
 };
 
-async function load() {
-  const seq = ++loadSeq;
-  const value = $("budget").value;
-  const query = new URLSearchParams({mode: currentMode});
-  if (value) query.set("budget", value);
-  const response = await fetch("/api/leaderboard?" + query);
-  if (!response.ok) throw Error(`Request failed (${response.status})`);
-  const data = await response.json();
-  if (seq !== loadSeq) return;
-  $("pollError").textContent = "";
-  currentMode = data.mode || currentMode;
-  localStorage.celestebenchMode = currentMode;
-  renderModeSwitch(data.modes || []);
-  $("benchmarkVersion").textContent = data.version ? "CelesteBench v" + data.version : "";
-  const select = $("budget");
-  const budgets = Array.isArray(data.budgets) ? data.budgets : [];
-  $("budgetControl").style.display = budgets.length ? "" : "none";
-  const selected = String(data.budget ?? "");
-  select.innerHTML = budgets.map(b => `<option value="${esc(b)}">${esc(Number(b).toFixed(1))} s</option>`).join("");
-  if (selected) select.value = selected;
-
-  const all = data.groups || [];
-  scoredRows = all.filter(row => row.scored > 0 && Number.isFinite(row.progress));
-  plottable = all.filter(row => row.status === "scored" && row.cost > 0 && Number.isFinite(row.progress));
-
-  const available = models();
-  const hidden = readSaved();
-  selectedModels = new Set(available.filter(m => !Array.isArray(hidden) || !hidden.includes(m)));
-
-  const availableHarnesses = harnesses();
-  const hiddenHarnesses = readSavedHarnesses();
-  selectedHarnesses = new Set(availableHarnesses.filter(
-    h => !Array.isArray(hiddenHarnesses) || !hiddenHarnesses.includes(h)));
-  saveHidden();
-
-  $("leaderboardControls").hidden = !available.length;
-  buildSelector();
-  renderChart();
-  renderTable();
-}
-
 const shortRun = name => String(name).replace(/\/rollout$/, "").split("/").pop();
 
 function renderTable() {
@@ -383,13 +312,15 @@ $("leaderboard").onclick = ev => {
     .forEach(row => row.hidden = !open);
 };
 
-$("budget").onchange = () => load().catch(error => $("pollError").textContent = error.message);
+$("budget").onchange = () => { budget = $("budget").value; load(); };
 $("modeSwitch").onclick = event => {
   const button = event.target.closest("button[data-mode]");
   if (!button || button.dataset.mode === currentMode) return;
   currentMode = button.dataset.mode;
-  $("budget").value = "";
-  load().catch(error => $("pollError").textContent = error.message);
+  localStorage.celestebenchMode = currentMode;
+  budget = "";
+  renderModeSwitch(data.modes);
+  load();
 };
 const togglePanel = (button, panel, otherPanel, otherButton) => {
   panel.hidden = !panel.hidden;
@@ -411,5 +342,48 @@ $("selectAll").onclick = () => setModels(true);
 $("selectNone").onclick = () => setModels(false);
 $("harnessSelectAll").onclick = () => setHarnesses(true);
 $("harnessSelectNone").onclick = () => setHarnesses(false);
-load().catch(error => $("pollError").textContent = error.message);
-</script></body></html>
+
+function load() {
+  const entry = data.entries[currentMode];
+  const budgets = Array.isArray(entry.budgets) ? entry.budgets : [];
+  $("budgetControl").style.display = budgets.length ? "" : "none";
+  const keyFor = b => Object.keys(entry.byBudget).find(k => Number(k) === Number(b)) ?? String(b);
+  const select = $("budget");
+  select.innerHTML = budgets.map(b => `<option value="${esc(keyFor(b))}">${esc(Number(b).toFixed(1))} s</option>`).join("");
+  if (!budgets.some(b => keyFor(b) === budget)) budget = budgets.length ? keyFor(budgets[0]) : "";
+  if (budget) select.value = budget;
+
+  const payload = entry.byBudget[String(budget)] || { groups: [] };
+  const all = payload.groups || [];
+  scoredRows = all.filter(row => row.scored > 0 && Number.isFinite(row.progress));
+  plottable = all.filter(row => row.status === "scored" && row.cost > 0 && Number.isFinite(row.progress));
+  $("benchmarkVersion").textContent = payload.version ? "CelesteBench v" + payload.version : "";
+
+  const available = models();
+  const hidden = readSaved();
+  selectedModels = new Set(available.filter(m => !Array.isArray(hidden) || !hidden.includes(m)));
+
+  const availableHarnesses = harnesses();
+  const hiddenHarnesses = readSavedHarnesses();
+  selectedHarnesses = new Set(availableHarnesses.filter(
+    h => !Array.isArray(hiddenHarnesses) || !hiddenHarnesses.includes(h)));
+  saveHidden();
+
+  $("leaderboardControls").hidden = !available.length;
+  buildSelector();
+  renderChart();
+  renderTable();
+}
+
+async function boot() {
+  const response = await fetch("/data/leaderboard.json");
+  if (!response.ok) throw Error(`Request failed (${response.status})`);
+  data = await response.json();
+  const saved = localStorage.celestebenchMode;
+  currentMode = data.modes.includes(saved) ? saved : (data.modes.includes("rtc") ? "rtc" : data.modes[0]);
+  localStorage.celestebenchMode = currentMode;
+  renderModeSwitch(data.modes);
+  load();
+}
+
+boot().catch(error => $("pollError").textContent = error.message);

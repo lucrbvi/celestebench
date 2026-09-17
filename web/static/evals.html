@@ -126,7 +126,7 @@ async function poll() {
   try {
     evalJobs = (await jsonRequest("/api/evals", {timeout: 10000})).filter(job => ["queued", "running"].includes(job.status));
     renderEvalJobs();
-    updateEvalPlan();
+    syncRows();
     if ($("pollError").textContent.startsWith("Refresh failed:")) $("pollError").textContent = "";
   } catch (error) { $("pollError").textContent = `Refresh failed: ${error.message}`; }
   finally { polling = false; }
@@ -134,13 +134,11 @@ async function poll() {
 
 /* The new-eval form is built from /api/harnesses, so a new external harness
    only needs a backend entry: no change here or in the launch code. */
-const optionsOf = field => field.choices.map(choice => typeof choice === "string"
-  ? {value: choice, label: choice} : choice);
 function control(field, value) {
   let input;
   if (field.kind === "choice") {
     input = document.createElement("select");
-    for (const choice of optionsOf(field)) {
+    for (const choice of field.choices) {
       const option = document.createElement("option");
       option.value = choice.value; option.textContent = choice.label;
       input.append(option);
@@ -231,7 +229,7 @@ function runRow(model = "", values = null) {
   const remove = document.createElement("button");
   remove.type = "button"; remove.className = "rm"; remove.textContent = "✕";
   remove.setAttribute("aria-label", "remove this run");
-  remove.onclick = () => { row.remove(); updateEvalPlan(); };
+  remove.onclick = () => { row.remove(); syncRows(); };
   row.append(remove);
   return row;
 }
@@ -276,7 +274,6 @@ function syncRows() {
   submit.disabled = !rows.some(row => row.model);
   submit.textContent = rows.length <= 1 ? "launch eval" : `launch ${rows.length} evals`;
 }
-function updateEvalPlan() { syncRows(); }
 function addRun() {
   const last = $("runRows").lastElementChild;
   if (last && !last.querySelector('[data-key="model"]').value.trim()) return;
@@ -291,7 +288,7 @@ function openEval() {
   $("evalOverlay").hidden = false;
   $("newEvalToggle").setAttribute("aria-expanded", "true");
   if (!$("runRows").children.length) $("runRows").append(runRow());
-  updateEvalPlan();
+  syncRows();
   const first = $("runRows").firstElementChild.querySelector('[data-key="model"]');
   if (first && !first.value) first.focus();
 }
@@ -316,7 +313,7 @@ async function submitEval(event) {
     closeEval();
     await poll();
   } catch (failure) { error.textContent = failure.message; }
-  updateEvalPlan();
+  syncRows();
   return false;
 }
 async function loadHarnesses() {
@@ -347,7 +344,7 @@ document.addEventListener("keydown", event => { if (event.key === "Escape" && !$
 $("evalHarness").onchange = selectHarness;
 $("harnessFields").addEventListener("input", applyWhen);
 $("harnessFields").addEventListener("change", applyWhen);
-$("runRows").addEventListener("input", updateEvalPlan);
+$("runRows").addEventListener("input", syncRows);
 $("addRun").onclick = addRun;
 loadHarnesses();
 poll();

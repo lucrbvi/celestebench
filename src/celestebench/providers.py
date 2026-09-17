@@ -20,10 +20,6 @@ from tau_coding.thinking import (
 from .catalog import _MODELS_DEV_PROVIDER_KEYS, _models_dev
 
 CUSTOM = "custom"
-# models.dev tags every model with the AI-SDK package serving it, while Tau's
-# catalog only keeps a provider-level protocol. Multi-protocol gateways (the
-# Zen endpoints serve qwen/minimax over Anthropic, gpt over Responses, the rest
-# over Completions) therefore resolve their wire format per model from here.
 _NPM_APIS = {
     "@ai-sdk/anthropic": "anthropic-messages",
     "@ai-sdk/google": "google-generative-ai",

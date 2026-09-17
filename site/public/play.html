@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>play · celestebench</title><link rel="stylesheet" href="/site.css"><style>
+#playPage{display:block;width:512px;max-width:100%;margin:0 auto}
+#stage{position:relative;margin:0 auto}
+#screen{width:512px;max-width:100%;height:auto;image-rendering:pixelated;background:#000;display:block}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(0,0,0,.62);text-align:center;padding:20px}
+#overlay p{margin:0;max-width:380px}
+#hud{display:flex;gap:18px;margin-top:8px;flex-wrap:wrap}
+#hud b{color:#eee;font-weight:normal;font-variant-numeric:tabular-nums}
+#controls{margin-top:10px}
+#result table{width:100%}
+#result tr.you td{background:#243224;color:#cfc}
+.keys{color:#888}
+</style></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/">leaderboard</a></nav></header>
+<main id="playPage"><section>
+  <div id="stage">
+    <canvas id="screen" width="128" height="128"></canvas>
+    <div id="overlay">
+      <p id="overlayText">Climb as far as you can.</p>
+      <p class="keys">arrows move &middot; Z jump &middot; X dash</p>
+      <button id="go" type="button">play</button>
+    </div>
+  </div>
+  <div id="hud">
+    <span>progress <b id="progress">0.00%</b></span>
+    <span>rooms <b id="rooms">0</b>/30</span>
+    <span>deaths <b id="deaths">0</b></span>
+    <span>time <b id="time">5:00</b></span>
+  </div>
+  <div id="controls"><button id="stop" type="button" disabled>stop</button></div>
+  <div id="result" hidden></div>
+</section></main>
+<script src="/player/open8.js"></script>
+<script src="/js/play.js"></script>
+</body></html>

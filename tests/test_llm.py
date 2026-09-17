@@ -1,11 +1,12 @@
 import asyncio
 import base64
-import functools
 import io
 import json
 
 import numpy as np
 import pytest
+
+from conftest import asyncio_test
 
 try:
     from PIL import Image
@@ -28,14 +29,6 @@ except ImportError:
 
 
 pytestmark = pytest.mark.skipif(TauPolicy is None, reason="celestebench[llm] is not installed")
-
-
-def asyncio_test(fn):
-    @functools.wraps(fn)
-    def wrapper():
-        return asyncio.run(fn())
-
-    return wrapper
 
 
 class FakeProvider:

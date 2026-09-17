@@ -15,9 +15,6 @@ from tau_agent import (
 
 from .prompt import system_prompt
 
-# Kept as the default export: the RTC flavor with the standard budgets.
-SYSTEM = system_prompt(fps=30)
-
 
 async def _select_action(call_id, arguments, signal=None, on_update=None):
     # Only select here. The shared rollout validates and applies the actions.

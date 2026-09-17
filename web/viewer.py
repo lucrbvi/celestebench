@@ -26,21 +26,7 @@ FPS = 30.0
 
 def _jsonl(path: Path) -> list[dict]:
     """Read complete JSON objects and ignore a truncated final write."""
-    if not path.is_file():
-        return []
-    rows = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return rows
-    for line in lines:
-        try:
-            value = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
+    return list(evals._rows(path))
 
 
 def _json(path: Path) -> dict:
@@ -288,6 +274,9 @@ def leaderboard(budget: float | None = None, mode: str | None = None) -> dict:
     for group in groups.values():
         scores = group.pop("scores")
         costs = group.pop("costs")
+        # A setup is represented by the mean of its runs, the point the range
+        # bars spread around. Best-first keeps the strongest run on top when the
+        # table unfolds; the minigame compares against that run, not the mean.
         group["scored_runs"].sort(key=lambda link: (-link["progress"], link["name"]))
         group["scored"] = len(scores)
         group["progress"] = round(sum(scores) / len(scores), 3) if scores else None
@@ -357,14 +346,18 @@ def load_decisions(name: str) -> dict:
     messages = _jsonl(folder / "messages.jsonl")
     _, native_fps = _video_info(folder / "rollout.mp4")
     fps = native_fps or FPS
+
+    def _decision(index, status, partial):
+        return {"decision": index, "screenshot": None, "thinking": None, "text": None,
+                "tool": None, "actions": [], "latency": 0.0, "t": 0.0, "from": 0.0,
+                "status": status, "partial": partial}
+
     decisions, current = [], None
     for msg in messages:
         if msg.get("role") == "user":
             if current is not None and not current.get("_assistant"):
                 current["status"], current["partial"] = "interrupted", True
-            current = {"decision": len(decisions), "screenshot": None, "thinking": None,
-                       "text": None, "tool": None, "actions": [], "latency": 0.0,
-                       "t": 0.0, "from": 0.0, "status": "unexecuted", "partial": False}
+            current = _decision(len(decisions), "unexecuted", False)
             content = msg.get("content", [])
             if isinstance(content, dict):
                 content = [content]
@@ -377,9 +370,7 @@ def load_decisions(name: str) -> dict:
             decisions.append(current)
         elif msg.get("role") == "assistant":
             if current is None or current.get("_assistant"):
-                current = {"decision": len(decisions), "screenshot": None, "thinking": None,
-                           "text": None, "tool": None, "actions": [], "latency": 0.0,
-                           "t": 0.0, "from": 0.0, "status": "unexecuted", "partial": True}
+                current = _decision(len(decisions), "unexecuted", True)
                 decisions.append(current)
             current["_assistant"] = True
             stop = msg.get("status") or msg.get("stop_reason") or msg.get("stopReason")
@@ -425,9 +416,7 @@ def load_decisions(name: str) -> dict:
         if type(index) is not int or index < 0:
             continue
         while len(decisions) <= index:
-            decisions.append({"decision": len(decisions), "screenshot": None, "thinking": None,
-                              "text": None, "tool": None, "actions": [], "latency": 0.0,
-                              "t": 0.0, "from": 0.0, "status": "unknown", "partial": False})
+            decisions.append(_decision(len(decisions), "unknown", False))
     # Rollouts persist observations separately, so they remain available when
     # an LLM trace is missing or contains no image content.
     for row in outcomes:

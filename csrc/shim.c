@@ -4,13 +4,6 @@
 // Access the upstream frame loop and VM without its interactive main().
 #include "core.c"
 
-void open8_init_api(lua_State* L);
-
-void init_api(lua_State* L)
-{
-    open8_init_api(L);
-}
-
 static SDL_Renderer* renderer;
 
 typedef struct shim_game_state
@@ -27,14 +20,6 @@ typedef struct shim_game_state
 static shim_game_state_t game_state;
 static int celeste_cart;
 static float spawn_feet[31];
-
-static int global_is_function(const char* name)
-{
-    lua_getglobal(vm, name);
-    int result = lua_isfunction(vm, -1);
-    lua_pop(vm, 1);
-    return result;
-}
 
 static void find_spawn_feet(void)
 {
@@ -223,6 +208,10 @@ int shim_init(void)
         return -1;
     }
 
+    // The host feeds every button through shim_step. SDL must not also read a
+    // gamepad, or its mapping would be OR-ed with the host's on every frame.
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+
     screen_rect.x = 0.0f;
     screen_rect.y = 0.0f;
     screen_rect.w = (float)128;
@@ -271,9 +260,9 @@ int shim_load_cart(const char* path)
         return -3;
     }
 
-    celeste_cart = global_is_function("level_index") &&
-                   global_is_function("load_room") &&
-                   global_is_function("solid_at");
+    celeste_cart = is_function_present(vm, "level_index") &&
+                   is_function_present(vm, "load_room") &&
+                   is_function_present(vm, "solid_at");
     if (celeste_cart)
     {
         find_spawn_feet();

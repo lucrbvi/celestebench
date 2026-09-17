@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import tempfile
 from pathlib import Path
@@ -6,10 +5,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-PATH = Path(__file__).parents[1] / "examples" / "opencode.py"
-spec = importlib.util.spec_from_file_location("opencode", PATH)
-opencode = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(opencode)
+from conftest import load_example
+
+opencode = load_example("opencode")
 
 
 def test_config_points_at_mcp_and_denies_every_builtin_tool():
@@ -66,8 +64,8 @@ def test_normalize_emits_one_assistant_row_per_play():
 
 
 @patch.object(opencode, "models", return_value=["opencode-go/deepseek-v4.1-flash"])
-@patch.object(opencode, "_stop_mcp")
-@patch.object(opencode, "wait_for_mcp", return_value=9123)
+@patch.object(opencode.harness, "stop_mcp")
+@patch.object(opencode.harness, "wait_for_mcp", return_value=9123)
 @patch.object(opencode.secrets, "token_urlsafe", return_value="generated-token")
 @patch.object(opencode.subprocess, "Popen")
 @patch.object(opencode.subprocess, "run")

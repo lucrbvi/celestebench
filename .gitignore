@@ -28,3 +28,11 @@ deps/open8-build/
 
 # Rollout outputs
 runs/
+
+# Public site: source lives in site/public, everything below is generated
+site/node_modules/
+site/.wrangler/
+site/public/data/
+site/public/player/
+site/public/logos/
+site/public/site.css

@@ -1,23 +1,9 @@
 """Public first-party API price of a rollout, from its logged token usage."""
 
-import json
 from pathlib import Path
 
 from . import catalog
-
-
-def _rows(path: Path):
-    try:
-        with path.open(encoding="utf-8", errors="replace") as file:
-            for line in file:
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(row, dict):
-                    yield row
-    except OSError:
-        return
+from .harness import rows
 
 
 def _rate(price: dict, context: int) -> dict:
@@ -39,7 +25,7 @@ def _usd(price: dict, context: int, input=0, output=0, cache_read=0, cache_write
 def _tau_usd(messages: Path, price: dict):
     """USD for a Tau rollout; its input count excludes the cached part."""
     total = None
-    for row in _rows(messages):
+    for row in rows(messages):
         usage = row.get("usage") if row.get("role") == "assistant" else None
         if not isinstance(usage, dict):
             continue
@@ -54,7 +40,7 @@ def _tau_usd(messages: Path, price: dict):
 def _codex_usd(trace: Path, price: dict):
     """USD for a Codex rollout; its input count already includes the cached part."""
     total = None
-    for row in _rows(trace):
+    for row in rows(trace):
         usage = row.get("usage") if row.get("type") == "turn.completed" else None
         if not isinstance(usage, dict):
             continue

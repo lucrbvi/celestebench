@@ -3,9 +3,9 @@
 Each harness declares its launcher and the settings it accepts, so the viewer
 renders the new-eval form and the backend validates a payload from the same
 table. The built-in Tau harness is marked `builtin`: it owns its provider and
-API-key handling. External harnesses (Codex, OpenCode and Pi) are plain commands
-billed through their own CLI; adding one is a new entry here plus its own script
-under examples/.
+API-key handling. External harnesses (Codex, Claude Code, OpenCode and Pi) are
+plain commands billed through their own CLI; adding one is a new entry here plus
+its own script under examples/.
 """
 
 from dataclasses import asdict, dataclass
@@ -40,7 +40,6 @@ class Harness:
     script: str
     run: tuple[Field, ...]  # one set per run row; "model" always comes first
     options: tuple[Field, ...] = ()
-    command: tuple[str, ...] = ()
     note: str = ""
     trace: str = ""  # external CLI JSON trace, e.g. codex.jsonl
     login_hint: str = ""
@@ -92,6 +91,31 @@ HARNESSES: dict[str, Harness] = {
         ),
         options=(
             Field("prompt", "task prompt", "textarea", PROMPT,
+                  help="Message sent to the CLI; the game rules ride in the system prompt"),
+        ),
+    ),
+    "claude": Harness(
+        key="claude",
+        label="Claude Code CLI",
+        script="examples/claude.py",
+        nested=True,
+        trace="claude.jsonl",
+        requires="claude",
+        concurrency=1,
+        note="Runs the host Claude Code CLI in an empty workspace with every built-in "
+             "tool off and only our MCP game server allowed, so it can only play. Loads "
+             "no settings source, no memory files and strictly only our MCP server, and "
+             "denies the network tools, so only the game reaches the model. Uses "
+             "ANTHROPIC_API_KEY or the host `claude login` session; runs queue because "
+             "they share it.",
+        run=(
+            Field("model", "model", required=True,
+                  help="Claude model or alias, e.g. sonnet, opus or claude-fable-5"),
+            Field("thinking_level", "effort", "choice", "low", choices=THINKING_LEVELS,
+                  help="Passed to Claude Code as --effort; off and minimal send no flag"),
+        ),
+        options=(
+            Field("prompt", "kickoff prompt", "textarea", PROMPT,
                   help="Message sent to the CLI; the game rules ride in the system prompt"),
         ),
     ),
@@ -147,6 +171,3 @@ HARNESSES: dict[str, Harness] = {
     ),
 }
 
-
-def field_by_key(harness: Harness, key: str) -> Field | None:
-    return next((field for field in (*harness.run, *harness.options) if field.key == key), None)

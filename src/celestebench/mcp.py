@@ -135,20 +135,21 @@ class Episode:
         self._log(content)
         return content
 
-    def _log(self, content):
+    def _append(self, row):
         if not self.output.is_dir():
             return
         with (self.output / "mcp.jsonl").open("a", encoding="utf-8") as trace:
-            trace.write(json.dumps({"role": "user", "content": [
-                item.model_dump(by_alias=True) for item in content]}, separators=(",", ":")) + "\n")
+            trace.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def _log(self, content):
+        self._append({"role": "user", "content": [
+            item.model_dump(by_alias=True) for item in content]})
 
     def _log_actions(self, actions):
-        if self.output.is_dir():
-            with (self.output / "mcp.jsonl").open("a", encoding="utf-8") as trace:
-                trace.write(json.dumps({"role": "assistant", "tool": "play", "actions": [
-                    {"action": "wait", "frames": frames} if buttons == "wait" else
-                    {"buttons": buttons, "frames": frames} for buttons, frames in actions
-                ]}, separators=(",", ":")) + "\n")
+        self._append({"role": "assistant", "tool": "play", "actions": [
+            {"action": "wait", "frames": frames} if buttons == "wait" else
+            {"buttons": buttons, "frames": frames} for buttons, frames in actions
+        ]})
 
     async def observe(self):
         if self._lock.locked():

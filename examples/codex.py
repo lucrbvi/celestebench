@@ -1,6 +1,5 @@
 """Run Codex against our MCP game server, jailed to an empty read-only workspace."""
 
-import argparse
 import json
 import os
 import secrets
@@ -33,16 +32,6 @@ extends = ":read-only"
 [permissions.celestebench.network]
 enabled = false
 """
-
-
-wait_for_mcp = harness.wait_for_mcp
-stop_process = harness.stop_process
-limit_output = harness.limit_output
-
-
-def _stop_mcp(process, rollout, timeout=0, grace=60):
-    # `stop` stays a codex module attribute so tests can patch it.
-    harness.stop_mcp(process, rollout, timeout, grace, stop=stop_process)
 
 
 # Codex reasoning efforts, weakest to strongest. Tau's "off" and "minimal" have
@@ -122,7 +111,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
             (home / "auth.json").symlink_to(login)
         mcp = subprocess.Popen(mcp_args, env=env, start_new_session=True)
         try:
-            port = wait_for_mcp(mcp, token, output)
+            port = harness.wait_for_mcp(mcp, token, output)
             # Codex never forwards the MCP server's `instructions` to the model,
             # so the game rules must be injected as developer instructions.
             instructions = system_prompt(fps=fps, max_frames=max_frames,
@@ -187,7 +176,7 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
                         stdout=trace,
                         stderr=subprocess.PIPE,
                         timeout=timeout + 30,
-                        preexec_fn=limit_output,
+                        preexec_fn=harness.limit_output,
                         check=False,
                     )
                 except subprocess.TimeoutExpired:
@@ -201,42 +190,13 @@ def run(prompt, model, output, timeout, fps, frames=None, max_frames=30,
             if not (rollout / "config.json").is_file():
                 harness.fail(trace_path, "Codex finished without using the game tools")
         finally:
-            _stop_mcp(mcp, rollout, timeout)
+            harness.stop_mcp(mcp, rollout, timeout)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", default=harness.PROMPT)
-    parser.add_argument("--model")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--frames", type=int)
-    parser.add_argument("--max-frames", type=int, default=30)
-    parser.add_argument("--max-images", type=int, default=3)
-    parser.add_argument("--thinking-level")
-    parser.add_argument("--fps", type=float)
-    args = parser.parse_args()
-    if (
-        args.timeout <= 0
-        or args.frames is not None
-        and args.frames <= 0
-        or args.max_frames <= 0
-        or args.max_images <= 0
-        or args.fps is not None
-        and args.fps <= 0
-    ):
-        parser.error("timeout, frames, max-frames, max-images, and fps must be positive")
-    run(
-        args.prompt,
-        args.model,
-        args.output,
-        args.timeout,
-        args.fps,
-        args.frames,
-        args.max_frames,
-        args.thinking_level,
-        args.max_images,
-    )
+    args = harness.cli_args(__doc__, model_required=False)
+    run(args.prompt, args.model, args.output, args.timeout, args.fps, args.frames,
+        args.max_frames, args.thinking_level, args.max_images)
 
 
 if __name__ == "__main__":

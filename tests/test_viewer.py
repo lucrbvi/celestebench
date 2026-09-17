@@ -1,14 +1,14 @@
+import contextlib
 import http.client
 import io
 import json
 import threading
 from unittest.mock import patch
 
-import av
-import numpy as np
 import pytest
 
 from celestebench import BENCHMARK_VERSION
+from conftest import video
 from web import export, viewer
 
 
@@ -19,6 +19,52 @@ def run_dir(root, name, *, video=None):
     if video is not None:
         (folder / "rollout.mp4").write_bytes(video)
     return folder
+
+
+def scored_run(root, name, progress=None, *, config=None, elapsed=10, score=None,
+               rows=None, **run):
+    """Write a scored rollout folder and return its scan_runs() entry."""
+    folder = root / name
+    folder.mkdir()
+    (folder / "config.json").write_text(json.dumps(
+        {"fps": 30, "max_frames": 30, "benchmark_version": BENCHMARK_VERSION,
+         **(config or {})}))
+    if score is None and progress is not None:
+        score = {"metric": "grounded_height_v1", "progress": progress,
+                 "elapsed": elapsed, "timing": "wall_clock", "status": "completed"}
+    if score is not None:
+        (folder / "score.json").write_text(json.dumps(score))
+    if rows is None and progress is not None:
+        rows = [{"elapsed": elapsed, "progress": progress}]
+    if rows is not None:
+        (folder / "progress.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+    return {"name": name, "model": "model", "harness": "tau",
+            "status": "completed", "timeout": 10, **run}
+
+
+@contextlib.contextmanager
+def patched_runs(root, runs):
+    with patch.object(viewer, "RUNS", root), \
+            patch.object(viewer, "scan_runs", return_value=runs):
+        yield
+
+
+def fake_handler(**attrs):
+    """A request-handler stub exposing the send_* surface the viewer calls."""
+    handler = type("FakeHandler", (), {
+        "wfile": io.BytesIO(),
+        "headers": {},
+        "response_headers": {},
+        "status": None,
+        "connection": type("Connection", (), {"settimeout": lambda self, value: None})(),
+        "send_response": lambda self, status: setattr(self, "status", status),
+        "send_header": lambda self, name, value: self.response_headers.__setitem__(name, value),
+        "end_headers": lambda self: None,
+        "send_error": lambda self, status: setattr(self, "status", status),
+    })()
+    for name, value in attrs.items():
+        setattr(handler, name, value)
+    return handler
 
 
 def test_scan_and_decisions_keep_partial_runs_and_exact_frames(tmp_path):
@@ -157,17 +203,7 @@ def test_legacy_actions_are_approximate_and_start_after_observation_frame(tmp_pa
 def test_http_ranges_and_path_containment(tmp_path):
     root = tmp_path
     run_dir(root, "run", video=b"0123456789")
-    class Fake:
-        path = "/video/run/rollout.mp4"
-        headers = {"Range": "bytes=2-5"}
-        wfile = io.BytesIO()
-        status = None
-        response_headers = {}
-        def send_response(self, status): self.status = status
-        def send_header(self, name, value): self.response_headers[name] = value
-        def end_headers(self): pass
-        def send_error(self, status): self.status = status
-    fake = Fake()
+    fake = fake_handler(path="/video/run/rollout.mp4", headers={"Range": "bytes=2-5"})
     viewer.Handler.video(fake, root / "run" / "rollout.mp4")
     assert fake.status == 206
     assert fake.wfile.getvalue() == b"2345"
@@ -186,17 +222,9 @@ def test_http_ranges_and_path_containment(tmp_path):
 
 
 def test_live_stream_waits_for_a_late_frame_and_ends_with_the_job(tmp_path):
-    class Fake:
-        close_connection = False
-        connection = type("Connection", (), {"settimeout": lambda self, value: None})()
-        wfile = io.BytesIO()
-        status = None
-        def send_response(self, status): self.status = status
-        def send_header(self, name, value): pass
-        def end_headers(self): pass
     folder = tmp_path / "run"
     folder.mkdir()
-    fake = Fake()
+    fake = fake_handler()
     calls = {"count": 0}
     def running():
         calls["count"] += 1
@@ -209,14 +237,6 @@ def test_live_stream_waits_for_a_late_frame_and_ends_with_the_job(tmp_path):
 
 
 def test_live_stream_finds_a_nested_rollout_created_after_it_opens(tmp_path):
-    class Fake:
-        close_connection = False
-        connection = type("Connection", (), {"settimeout": lambda self, value: None})()
-        wfile = io.BytesIO()
-        status = None
-        def send_response(self, status): self.status = status
-        def send_header(self, name, value): pass
-        def end_headers(self): pass
     folder = tmp_path / "run"
     folder.mkdir()
     frame = b"\x89PNG\r\nnested"
@@ -229,7 +249,7 @@ def test_live_stream_finds_a_nested_rollout_created_after_it_opens(tmp_path):
             (rollout / "live.png").write_bytes(frame)
             (rollout / "live.done").touch()
         return calls["count"] < 4
-    fake = Fake()
+    fake = fake_handler()
     viewer.Handler.live(fake, folder, running)
     assert frame in fake.wfile.getvalue()
 
@@ -272,12 +292,7 @@ def test_persisted_screenshot_is_used_and_served_safely(tmp_path):
     with patch.object(viewer, "RUNS", root):
         decision = viewer.load_decisions("run")["decisions"][0]
         assert decision["screenshot"] == "/screenshot/run/screenshots/000000.png"
-        fake = type("Fake", (), {
-            "path": "/screenshot/run/screenshots/000000.png", "headers": {},
-            "wfile": io.BytesIO(), "send_response": lambda s, n: setattr(s, "status", n),
-            "send_header": lambda s, k, v: None, "end_headers": lambda s: None,
-            "send_error": lambda s, n: setattr(s, "status", n), "status": None,
-        })()
+        fake = fake_handler(path="/screenshot/run/screenshots/000000.png")
         fake.image = viewer.Handler.image.__get__(fake)
         viewer.Handler.do_GET(fake)
         assert fake.status == 200
@@ -300,38 +315,13 @@ def test_wait_marker_is_preserved_for_the_viewer(tmp_path):
 
 def test_leaderboard_uses_one_wall_clock_event_and_keeps_unscored_runs(tmp_path):
     root = tmp_path
-    runs = []
-    for name, progress, level in (("a", 40, "low"), ("b", 60, "low"), ("different", 90, "off")):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps({
-            "fps": 30, "thinking_level": level, "max_frames": 30,
-            "benchmark_version": BENCHMARK_VERSION,
-        }))
-        (folder / "score.json").write_text(json.dumps({
-            "version": 1, "metric": "grounded_height_v1", "progress": progress,
-            "status": "completed",
-            "elapsed": 10, "timing": "wall_clock",
-        }))
-        (folder / "progress.jsonl").write_text("\n".join(json.dumps(row) for row in [
-            {"elapsed": 5, "progress": progress - 10},
-            {"elapsed": 10, "progress": progress},
-        ]))
-        runs.append({"name": name, "model": "model", "harness": "tau",
-                     "status": "completed", "timeout": 10, "elapsed": 10})
-    short = root / "short"
-    short.mkdir()
-    (short / "config.json").write_text(json.dumps({"fps": 30, "thinking_level": "low",
-                                                   "max_frames": 30,
-                                                   "benchmark_version": BENCHMARK_VERSION}))
-    (short / "score.json").write_text(json.dumps({
-        "version": 1, "metric": "grounded_height_v1", "progress": 80,
-        "elapsed": 4, "timing": "wall_clock", "status": "completed",
-    }))
-    (short / "progress.jsonl").write_text(json.dumps({"elapsed": 4, "progress": 80}))
-    runs.append({"name": "short", "model": "model", "harness": "tau",
-                 "status": "completed", "timeout": 10, "elapsed": 4})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+    runs = [scored_run(root, name, progress, config={"thinking_level": level},
+                       rows=[{"elapsed": 5, "progress": progress - 10},
+                             {"elapsed": 10, "progress": progress}])
+            for name, progress, level in (("a", 40, "low"), ("b", 60, "low"),
+                                          ("different", 90, "off"))]
+    runs.append(scored_run(root, "short", 80, elapsed=4, config={"thinking_level": "low"}))
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     assert result["excluded"] == {"replay": 0, "unknown_timing": 0}
     grouped = {(row["settings"]["thinking_level"]): row for row in result["groups"]}
@@ -346,22 +336,13 @@ def test_leaderboard_uses_one_wall_clock_event_and_keeps_unscored_runs(tmp_path)
 
 def test_leaderboard_does_not_score_replay_or_legacy_scoreless_runs(tmp_path):
     root = tmp_path
-    replay = root / "replay"
-    replay.mkdir()
-    (replay / "config.json").write_text(json.dumps(
-        {"benchmark_version": BENCHMARK_VERSION}))
-    (replay / "score.json").write_text(json.dumps({
-        "metric": "grounded_height_v1", "progress": 70, "elapsed": 10,
-        "timing": "replay", "status": "completed",
-    }))
-    (replay / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 70}))
-    legacy = root / "legacy"
-    legacy.mkdir()
-    (legacy / "config.json").write_text(json.dumps(
-        {"benchmark_version": BENCHMARK_VERSION}))
-    runs = [{"name": "replay", "model": "m", "harness": "tau", "status": "completed", "timeout": 10},
-            {"name": "legacy", "model": "m", "harness": "tau", "status": "completed", "timeout": 10}]
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+    runs = [
+        scored_run(root, "replay", 70, config={}, rows=[{"elapsed": 10, "progress": 70}],
+                   score={"metric": "grounded_height_v1", "progress": 70, "elapsed": 10,
+                          "timing": "replay", "status": "completed"}, model="m"),
+        scored_run(root, "legacy", config={}, model="m"),
+    ]
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     assert result["excluded"]["replay"] == 1
     assert all(row["status"] == "unscored" for row in result["groups"])
@@ -373,22 +354,15 @@ def test_leaderboard_reads_score_options_and_excludes_failed_archives(tmp_path):
     for name, level, status, system in [
             ("a", "low", "completed", "first"), ("b", "off", "completed", "first"),
             ("c", "low", "error", "first"), ("d", "low", "completed", "other")]:
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps({
-            "system": system,
-            "benchmark_version": BENCHMARK_VERSION}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": 2, "elapsed": 20,
-            "timing": "wall_clock", "status": status,
-            "options": {"thinking_level": level, "fps": 30},
-        }))
-        (folder / "progress.jsonl").write_text(
-            '\n'.join(json.dumps(row) for row in [
-                {"elapsed": 0, "progress": 0}, {"elapsed": 9, "progress": 1},
-                {"elapsed": 11, "progress": 2}]))
-        runs.append({"name": name, "model": "m", "status": "archived", "timeout": 20})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+        score = {"metric": "grounded_height_v1", "progress": 2, "elapsed": 20,
+                 "timing": "wall_clock", "status": status,
+                 "options": {"thinking_level": level, "fps": 30}}
+        runs.append(scored_run(
+            root, name, config={"system": system}, score=score, model="m",
+            status="archived", timeout=20,
+            rows=[{"elapsed": 0, "progress": 0}, {"elapsed": 9, "progress": 1},
+                  {"elapsed": 11, "progress": 2}]))
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     assert len(result["groups"]) == 2
     assert sum(row["scored"] for row in result["groups"]) == 3
@@ -403,19 +377,12 @@ def test_leaderboard_excludes_invalid_scores_and_merges_prompt_metadata(tmp_path
             ("verified", {"system_prompt_sent": True}, 10, None),
             ("unknown", {}, 20, None),
             ("invalid", {"system_prompt_sent": True}, 999, "missing_system_prompt")]:
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps(
-            config | {"benchmark_version": BENCHMARK_VERSION}))
         score = {"metric": "grounded_height_v1", "progress": progress,
                  "elapsed": 10, "timing": "wall_clock", "status": "completed"}
         if invalid:
             score["invalid_reason"] = invalid
-        (folder / "score.json").write_text(json.dumps(score))
-        (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": progress}))
-        runs.append({"name": name, "model": "m", "harness": "tau",
-                     "status": "completed", "timeout": 10})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+        runs.append(scored_run(root, name, progress, config=config, score=score, model="m"))
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     assert len(result["groups"]) == 1
     assert result["groups"][0]["progress"] == 15
@@ -427,26 +394,16 @@ def test_leaderboard_prices_rollouts_and_hides_older_versions(tmp_path):
     root = tmp_path
     runs = []
     for name, version in (("old", "0.1"), ("current", BENCHMARK_VERSION)):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps({
-            "model": "gpt-5.6-sol", "fps": 30, "max_frames": 30,
-            "benchmark_version": version}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
-            "timing": "wall_clock", "status": "completed"}))
-        (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
-        (folder / "messages.jsonl").write_text(json.dumps({
+        runs.append(scored_run(
+            root, name, 50, config={"model": "gpt-5.6-sol", "benchmark_version": version},
+            model="gpt-5.6-sol"))
+        (root / name / "messages.jsonl").write_text(json.dumps({
             "role": "assistant",
             "usage": {"input": 1000, "output": 2000, "cacheRead": 0,
                       "cacheWrite": 0}}) + "\n")
-        runs.append({"name": name, "model": "gpt-5.6-sol", "harness": "tau",
-                     "status": "completed", "timeout": 10})
     prices = {"openai": {"models": {"gpt-5.6-sol": {
         "id": "gpt-5.6-sol", "cost": {"input": 4, "output": 20}}}}}
-    with patch.object(viewer, "RUNS", root), \
-            patch.object(viewer, "scan_runs", return_value=runs), \
-            patch.object(catalog, "_models_dev", return_value=prices):
+    with patched_runs(root, runs), patch.object(catalog, "_models_dev", return_value=prices):
         result = viewer.leaderboard(10)
     assert result["version"] == BENCHMARK_VERSION
     assert len(result["groups"]) == 1
@@ -459,22 +416,11 @@ def test_leaderboard_prices_rollouts_and_hides_older_versions(tmp_path):
 
 def test_leaderboard_folds_old_none_into_thinking_off(tmp_path):
     root = tmp_path
-    runs = []
-    for name, level in (("old", {"reasoning_effort": "none"}),
-                        ("new", {"thinking_level": "off"}),
-                        ("hot", {"reasoning_effort": "high"})):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps({
-            "fps": 30, "max_frames": 30,
-            "benchmark_version": BENCHMARK_VERSION, **level}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
-            "timing": "wall_clock", "status": "completed"}))
-        (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
-        runs.append({"name": name, "model": "model", "harness": "tau",
-                     "status": "completed", "timeout": 10})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+    runs = [scored_run(root, name, 50, config=level)
+            for name, level in (("old", {"reasoning_effort": "none"}),
+                                ("new", {"thinking_level": "off"}),
+                                ("hot", {"reasoning_effort": "high"}))]
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     merged = next(row for row in result["groups"]
                   if row["settings"]["thinking_level"] == "off")
@@ -492,19 +438,9 @@ def test_leaderboard_keeps_harnesses_and_setting_generations_apart(tmp_path):
             ("tau-old", "tau", {"api": "openai-responses"}, 40),
             ("tau-new", "tau", {"provider": "opencode-go"}, 60),
             ("codex", "codex", {}, 80)):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps({
-            "thinking_level": "low", "fps": 30, "max_frames": 30,
-            "benchmark_version": BENCHMARK_VERSION, **config}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": progress, "elapsed": 10,
-            "timing": "wall_clock", "status": "completed"}))
-        (folder / "progress.jsonl").write_text(
-            json.dumps({"elapsed": 10, "progress": progress}))
-        runs.append({"name": name, "model": "model", "harness": harness,
-                     "status": "completed", "timeout": 10})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+        runs.append(scored_run(root, name, progress,
+                               config={"thinking_level": "low", **config}, harness=harness))
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     assert len(result["groups"]) == 3
     assert {row["settings"]["harness"] for row in result["groups"]} == {"tau", "codex"}
@@ -512,19 +448,9 @@ def test_leaderboard_keeps_harnesses_and_setting_generations_apart(tmp_path):
 
 def test_leaderboard_switches_between_rtc_and_lite(tmp_path):
     root = tmp_path
-    runs = []
-    for name, fps, progress in (("rtc", 30, 40), ("lite", None, 80)):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps(
-            {"model": "m", "fps": fps, "benchmark_version": BENCHMARK_VERSION}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": progress, "elapsed": 10,
-            "timing": "wall_clock", "status": "completed"}))
-        (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": progress}))
-        runs.append({"name": name, "model": "m", "harness": "tau",
-                     "status": "completed", "timeout": 10})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+    runs = [scored_run(root, name, progress, config={"model": "m", "fps": fps}, model="m")
+            for name, fps, progress in (("rtc", 30, 40), ("lite", None, 80))]
+    with patched_runs(root, runs):
         rtc = viewer.leaderboard(10, "rtc")
         lite = viewer.leaderboard(10, "lite")
     assert rtc["modes"] == ["lite", "rtc"]
@@ -536,22 +462,13 @@ def test_leaderboard_switches_between_rtc_and_lite(tmp_path):
 
 def test_leaderboard_folds_model_aliases_and_gateway_prefixes(tmp_path):
     root = tmp_path
-    runs = []
-    for name, model, harness in (
-            ("tau", "deepseek-flash", "tau"),
-            ("opencode", "opencode-go/deepseek-v4.1-flash", "opencode"),
-            ("vision", "deepseek-v4-flash-vision-exp", "tau")):
-        folder = root / name
-        folder.mkdir()
-        (folder / "config.json").write_text(json.dumps(
-            {"thinking_level": "low", "fps": 30, "benchmark_version": BENCHMARK_VERSION}))
-        (folder / "score.json").write_text(json.dumps({
-            "metric": "grounded_height_v1", "progress": 50, "elapsed": 10,
-            "timing": "wall_clock", "status": "completed"}))
-        (folder / "progress.jsonl").write_text(json.dumps({"elapsed": 10, "progress": 50}))
-        runs.append({"name": name, "model": model, "harness": harness,
-                     "status": "completed", "timeout": 10})
-    with patch.object(viewer, "RUNS", root), patch.object(viewer, "scan_runs", return_value=runs):
+    runs = [scored_run(root, name, 50, config={"thinking_level": "low"},
+                       model=model, harness=harness)
+            for name, model, harness in (
+                ("tau", "deepseek-flash", "tau"),
+                ("opencode", "opencode-go/deepseek-v4.1-flash", "opencode"),
+                ("vision", "deepseek-v4-flash-vision-exp", "tau"))]
+    with patched_runs(root, runs):
         result = viewer.leaderboard(10)
     pairs = {(row["model"], row["settings"]["harness"]) for row in result["groups"]}
     assert pairs == {("deepseek-v4.1-flash", "tau"),
@@ -604,12 +521,7 @@ def test_json_ignores_a_client_that_disconnects_before_the_body():
         def write(self, body):
             raise BrokenPipeError
 
-    handler = type("Handler", (), {
-        "wfile": ClosedClient(),
-        "send_response": lambda self, status: None,
-        "send_header": lambda self, name, value: None,
-        "end_headers": lambda self: None,
-    })()
+    handler = fake_handler(wfile=ClosedClient())
     viewer.Handler.json(handler, {"ok": True})
 
 
@@ -776,14 +688,7 @@ def test_video_stays_raw_and_export_endpoint_downloads_the_annotation(tmp_path, 
     (folder / "actions.jsonl").write_text(json.dumps({
         "decision": 0, "buttons": 2, "frames": 2,
         "frame_start": 1, "frame_end": 3}) + "\n")
-    with av.open(str(folder / "rollout.mp4"), "w", format="mp4") as out:
-        stream = out.add_stream("libx264", rate=30)
-        stream.width = stream.height = 512
-        stream.pix_fmt = "yuv420p"
-        for _ in range(3):
-            out.mux(stream.encode(av.VideoFrame.from_ndarray(
-                np.zeros((512, 512, 3), np.uint8), format="rgb24")))
-        out.mux(stream.encode())
+    video(folder / "rollout.mp4")
     with patch.object(viewer, "RUNS", root), patch.object(export, "RUNS", root):
         status, content_type, body = get_bytes(connection, "/video/run/rollout.mp4")
         assert (status, content_type) == (200, "video/mp4")

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from conftest import wait_until
 from web import evals
 
 class FakeProcess:
@@ -30,19 +31,33 @@ class FakeProcess:
         self.returncode = -9
 
 
+class Blocking(FakeProcess):
+    def __init__(self, args, gate, **kwargs):
+        super().__init__(args, **kwargs)
+        self.gate = gate
+
+    def communicate(self):
+        self.gate.wait(2)
+        return None, ""
+
+
 @pytest.fixture(autouse=True)
 def clean_registry():
     evals._jobs.clear()
     evals._processes.clear()
 
 
-def wait_until(predicate, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.01)
-    pytest.fail("Condition not reached before timeout.")
+@pytest.fixture
+def processes(monkeypatch):
+    recorded = []
+
+    def launch(args, **kwargs):
+        process = FakeProcess(args, **kwargs)
+        recorded.append(process)
+        return process
+
+    monkeypatch.setattr(evals.subprocess, "Popen", launch)
+    return recorded
 
 
 def test_validation_happens_before_filesystem_changes():
@@ -61,15 +76,8 @@ def test_invalid_model_in_batch_starts_nothing():
         launch.assert_not_called()
 
 
-def test_models_share_settings_and_each_gets_its_own_job():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
+def test_models_share_settings_and_each_gets_its_own_job(processes):
+    with tempfile.TemporaryDirectory() as directory:
         jobs = evals.start_eval({"models": ["m/a", "m/b", "m/a"], "api_key": "s"},
                                 Path(directory))
         assert [job["model"] for job in jobs] == ["m/a", "m/b", "m/a"]
@@ -81,15 +89,8 @@ def test_models_share_settings_and_each_gets_its_own_job():
         time.sleep(0.1)
 
 
-def test_provider_tags_reroute_single_jobs_to_their_own_key():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
+def test_provider_tags_reroute_single_jobs_to_their_own_key(processes):
+    with tempfile.TemporaryDirectory() as directory, \
             patch.dict(os.environ, {"OPENCODE_API_KEY": "go-secret",
                                     "MINIMAX_API_KEY": "mm-secret"}):
         jobs = evals.start_eval({"models": ["glm-5.3@opencode-go", "minimax-m3@minimax"],
@@ -105,15 +106,8 @@ def test_provider_tags_reroute_single_jobs_to_their_own_key():
         time.sleep(0.1)
 
 
-def test_runs_default_to_the_dialog_provider():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
+def test_runs_default_to_the_dialog_provider(processes):
+    with tempfile.TemporaryDirectory() as directory:
         jobs = evals.start_eval({"models": ["qwen3.8-flash", "glm-5.3"],
                                  "provider": "opencode-go", "api_key": "s"},
                                 Path(directory))
@@ -143,33 +137,19 @@ def test_unknown_provider_override_starts_nothing():
         launch.assert_not_called()
 
 
-def test_thinking_level_reaches_every_job_without_special_casing():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
+def test_thinking_level_reaches_every_job_without_special_casing(processes):
+    with tempfile.TemporaryDirectory() as directory, \
             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "ant-secret"}):
-        jobs = evals.start_eval({"models": ["claude-sonnet-4-6@anthropic", "glm-5.3"],
-                                 "api_key": "s", "thinking_level": "high"},
-                                Path(directory))
+        evals.start_eval({"models": ["claude-sonnet-4-6@anthropic", "glm-5.3"],
+                          "api_key": "s", "thinking_level": "high"},
+                         Path(directory))
         wait_until(lambda: all(j["status"] == "completed" for j in evals._jobs.values()))
         assert all("--thinking-level=high" in process.args for process in processes)
         time.sleep(0.1)
 
 
-def test_runs_apply_per_run_thinking_and_the_mode_budget():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
+def test_runs_apply_per_run_thinking_and_the_mode_budget(processes):
+    with tempfile.TemporaryDirectory() as directory:
         jobs = evals.start_eval({"harness": "tau", "api_key": "s", "mode": "lite",
                                  "evals": [
                                      {"model": "glm-5.3", "thinking_level": "low"},
@@ -197,13 +177,8 @@ def test_unknown_run_setting_starts_nothing():
 def test_stop_cancels_a_queued_evaluation():
     gate = threading.Event()
 
-    class Blocking(FakeProcess):
-        def communicate(self):
-            gate.wait(2)
-            return None, ""
-
     with tempfile.TemporaryDirectory() as directory, patch.object(
-            evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
+            evals.subprocess, "Popen", lambda a, **k: Blocking(a, gate, **k)), \
             patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
         jobs = evals.start_eval({"harness": "codex", "models": ["a", "b", "c", "d", "e"]},
                                 Path(directory))
@@ -214,19 +189,13 @@ def test_stop_cancels_a_queued_evaluation():
         assert evals._jobs[jobs[4]["id"]]["status"] == "cancelled"
 
 
-def test_start_uses_fresh_rollout_and_keeps_secret_out_of_argv_and_metadata():
-    process = None
-
-    def launch(args, **kwargs):
-        nonlocal process
-        process = FakeProcess(args, **kwargs)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch):
+def test_start_uses_fresh_rollout_and_keeps_secret_out_of_argv_and_metadata(processes):
+    with tempfile.TemporaryDirectory() as directory:
         jobs = evals.start_eval({"model": "demo/model", "provider": "mistral",
                                  "api_key": "secret-value"}, Path(directory))
         job = jobs[0]
         time.sleep(0.02)
+        process = processes[0]
         assert process is not None
         assert "--provider=mistral" in process.args
         output_arg = next(value for value in process.args if value.startswith("--output="))
@@ -321,38 +290,14 @@ def test_codex_countdown_starts_when_the_engine_runs_not_at_launch():
         assert job["frames"] == 3
 
 
-def test_codex_jobs_queue_on_a_shared_login():
+@pytest.mark.parametrize("codex_key", ["", "k"])
+def test_codex_jobs_queue_on_a_shared_login(codex_key):
     gate = threading.Event()
 
-    class Blocking(FakeProcess):
-        def communicate(self):
-            gate.wait(2)
-            return None, ""
-
     with tempfile.TemporaryDirectory() as directory, \
-            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
+            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, gate, **k)), \
             patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
-            patch.dict(evals.os.environ, {"CODEX_API_KEY": ""}):
-        jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"]},
-                                Path(directory))
-        assert [job["status"] for job in jobs] == ["running"] + ["queued"] * 4
-        gate.set()
-        wait_until(lambda: all(evals._jobs[job["id"]]["status"] == "completed"
-                               for job in jobs))
-
-
-def test_codex_api_key_jobs_queue_too():
-    gate = threading.Event()
-
-    class Blocking(FakeProcess):
-        def communicate(self):
-            gate.wait(2)
-            return None, ""
-
-    with tempfile.TemporaryDirectory() as directory, \
-            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
-            patch.object(evals.shutil, "which", return_value="/usr/bin/codex"), \
-            patch.dict(evals.os.environ, {"CODEX_API_KEY": "k"}):
+            patch.dict(evals.os.environ, {"CODEX_API_KEY": codex_key}):
         jobs = evals.start_eval({"harness": "codex", "models": ["m1", "m2", "m3", "m4", "m5"]},
                                 Path(directory))
         assert [job["status"] for job in jobs] == ["running"] + ["queued"] * 4
@@ -364,13 +309,8 @@ def test_codex_api_key_jobs_queue_too():
 def test_opencode_oauth_runs_serialize_while_api_runs_parallelize():
     gate = threading.Event()
 
-    class Blocking(FakeProcess):
-        def communicate(self):
-            gate.wait(2)
-            return None, ""
-
     with tempfile.TemporaryDirectory() as directory, \
-            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
+            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, gate, **k)), \
             patch.object(evals.shutil, "which", return_value="/usr/bin/opencode"), \
             patch.object(evals.auth, "oauth",
                          side_effect=lambda _h, model: model.startswith("openai/")), \
@@ -388,16 +328,11 @@ def test_opencode_oauth_runs_serialize_while_api_runs_parallelize():
 def test_pi_oauth_runs_serialize_while_api_runs_parallelize():
     gate = threading.Event()
 
-    class Blocking(FakeProcess):
-        def communicate(self):
-            gate.wait(2)
-            return None, ""
-
     def oauth(_harness, model):
         return model.startswith("openai-codex/")
 
     with tempfile.TemporaryDirectory() as directory, \
-            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, **k)), \
+            patch.object(evals.subprocess, "Popen", lambda a, **k: Blocking(a, gate, **k)), \
             patch.object(evals.shutil, "which", return_value="/usr/bin/pi"), \
             patch.object(evals.auth, "oauth", side_effect=oauth), \
             patch.object(evals.auth, "provider",
@@ -411,15 +346,8 @@ def test_pi_oauth_runs_serialize_while_api_runs_parallelize():
                                for job in jobs))
 
 
-def test_codex_harness_launches_the_local_cli_with_mode_budgets():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
+def test_codex_harness_launches_the_local_cli_with_mode_budgets(processes):
+    with tempfile.TemporaryDirectory() as directory, \
             patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
         jobs = evals.start_eval({"harness": "codex", "model": "gpt-5.2", "mode": "rtc"},
                                 Path(directory))
@@ -439,15 +367,8 @@ def test_codex_harness_launches_the_local_cli_with_mode_budgets():
         time.sleep(0.1)
 
 
-def test_codex_runs_carry_reasoning_and_a_paused_mode():
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
-
-    with tempfile.TemporaryDirectory() as directory, patch.object(evals.subprocess, "Popen", launch), \
+def test_codex_runs_carry_reasoning_and_a_paused_mode(processes):
+    with tempfile.TemporaryDirectory() as directory, \
             patch.object(evals.shutil, "which", return_value="/usr/bin/codex"):
         jobs = evals.start_eval({"harness": "codex", "mode": "lite", "evals": [
             {"model": "gpt-5.2", "thinking_level": "high"},
@@ -488,21 +409,14 @@ def test_codex_harness_validation_starts_nothing():
         assert list(Path(directory).iterdir()) == []
 
 
-def test_external_harnesses_catalog_and_launch():
+def test_external_harnesses_catalog_and_launch(processes):
     catalog = {entry["key"]: entry for entry in evals.harness_catalog()["harnesses"]}
     for key in ("opencode", "pi"):
         assert not catalog[key]["builtin"]
         assert [field["key"] for field in catalog[key]["run"]] == ["model", "thinking_level"]
         assert [field["key"] for field in catalog[key]["options"]] == ["prompt"]
-    processes = []
-
-    def launch(args, **kwargs):
-        process = FakeProcess(args, **kwargs)
-        processes.append(process)
-        return process
 
     with tempfile.TemporaryDirectory() as directory, \
-            patch.object(evals.subprocess, "Popen", launch), \
             patch.object(evals.shutil, "which", return_value="/usr/bin/opencode"):
         evals.start_eval({"harness": "opencode", "model": "opencode-go/deepseek",
                           "mode": "rtc"}, Path(directory))

@@ -1,0 +1,36 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>runs · celestebench</title><link rel="stylesheet" href="/site.css"><style>
+#stage{position:relative;width:512px}
+#screen{width:512px;height:512px;image-rendering:pixelated;background:#000;display:block}
+#buffering{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);color:#ddd}
+#controls{display:flex;align-items:center;gap:6px;margin-top:6px;width:512px}
+#clock{color:#999;margin-left:6px;font-variant-numeric:tabular-nums}
+#speedLabel{margin-left:auto;color:#888}
+</style></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><span id="meta" class="meta"></span><span id="pollError" role="status"></span><nav><a href="/">leaderboard</a></nav></header>
+<main>
+<aside id="list"></aside>
+<section>
+  <div id="stage">
+    <canvas id="screen" width="128" height="128"></canvas>
+    <div id="buffering" hidden>replaying…</div>
+  </div>
+  <div id="timeline"><div id="playhead"></div></div>
+  <div id="controls">
+    <button id="playPause" type="button">play</button>
+    <button id="toStart" type="button" title="jump to start">start</button>
+    <button id="back" type="button" title="back 10 seconds">&minus;10s</button>
+    <button id="fwd" type="button" title="forward 10 seconds">+10s</button>
+    <button id="toEnd" type="button" title="jump to end">end</button>
+    <span id="clock">0:00 / 0:00</span>
+    <label id="speedLabel">speed <select id="speed" aria-label="playback speed">
+      <option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option><option value="4">4x</option><option value="8">8x</option><option value="16">16x</option>
+    </select></label>
+  </div>
+</section>
+<section id="panel"></section>
+</main>
+<script src="/player/open8.js"></script>
+<script src="/js/player.js"></script>
+</body></html>

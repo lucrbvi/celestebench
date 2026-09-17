@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>leaderboard · celestebench</title><link rel="stylesheet" href="/site.css"></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a class="button" href="/play">benchmark yourself</a></nav></header>
+<main id="leaderboardPage"><section><h2>leaderboard <span id="benchmarkVersion" class="meta"></span></h2>
+<div id="modeSwitch" class="modeswitch" role="group" aria-label="benchmark mode">
+  <button type="button" data-mode="rtc">RTC</button>
+  <button type="button" data-mode="lite">Lite</button>
+</div>
+<label id="budgetControl">budget <select id="budget" aria-label="wall-clock budget"></select></label>
+<div id="leaderboardControls" hidden>
+  <div class="selector">
+    <button id="selectorToggle" type="button" aria-expanded="false">0 of 0 models</button>
+    <div id="selectorPanel" class="selector-panel" hidden>
+      <div class="selector-actions"><button id="selectAll" type="button">all</button><button id="selectNone" type="button">none</button></div>
+      <div id="selectorList"></div>
+    </div>
+  </div>
+  <div class="selector">
+    <button id="harnessToggle" type="button" aria-expanded="false">0 of 0 harnesses</button>
+    <div id="harnessPanel" class="selector-panel" hidden>
+      <div class="selector-actions"><button id="harnessSelectAll" type="button">all</button><button id="harnessSelectNone" type="button">none</button></div>
+      <div id="harnessList"></div>
+    </div>
+  </div>
+</div>
+<div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
+<div id="chartEmpty" class="meta" hidden>no cost data</div>
+<div id="leaderboard" class="table-wrap">loading…</div>
+</section></main>
+<script src="/js/leaderboard.js"></script></body></html>
