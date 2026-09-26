@@ -1,7 +1,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>leaderboard · celestebench</title><link rel="stylesheet" href="/site.css"></head>
 <body>
-<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a class="button" href="/play">benchmark yourself</a></nav></header>
+<header><h1><a href="/">celestebench</a></h1><span id="pollError" role="status"></span><nav><a href="/about">about</a><a class="button" href="/play">benchmark yourself</a><a class="gh" href="https://github.com/lucrbvi/celestebench" aria-label="GitHub" title="GitHub"><img src="/logos/github.svg" alt=""></a></nav></header>
 <main id="leaderboardPage"><section><h2>leaderboard <span id="benchmarkVersion" class="meta"></span></h2>
 <div id="modeSwitch" class="modeswitch" role="group" aria-label="benchmark mode">
   <button type="button" data-mode="rtc">RTC</button>
@@ -24,7 +24,7 @@
     </div>
   </div>
 </div>
-<div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
+<div id="chartWrap" class="chart-wrap" hidden><svg id="chart" viewBox="0 0 820 380" preserveAspectRatio="xMidYMid meet" role="img" aria-label="avg API cost versus score"></svg><div id="chartTooltip" class="chart-tooltip" hidden></div><div id="scaleSwitch" class="scale-switch modeswitch" role="group" aria-label="cost axis scale"><button type="button" data-scale="log">log</button><button type="button" data-scale="linear">linear</button></div></div>
 <div id="chartEmpty" class="meta" hidden>no cost data</div>
 <div id="leaderboard" class="table-wrap">loading…</div>
 </section></main>

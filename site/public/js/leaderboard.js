@@ -59,6 +59,7 @@ const readSavedHarnesses = () => { try { return JSON.parse(localStorage.celesteb
 let data = null;
 let plottable = [], selectedModels = new Set(), selectedHarnesses = new Set(), scoredRows = [], chartPoints = [];
 let currentMode = localStorage.celestebenchMode || "rtc";
+let chartScale = localStorage.celestebenchCostScale === "linear" ? "linear" : "log";
 let budget = "";
 function renderModeSwitch(modes) {
   $("modeSwitch").querySelectorAll("button").forEach(button => {
@@ -148,17 +149,21 @@ function renderChart() {
   const base = pts;
   const W = 820, H = 380, L = 58, R = 24, T = 20, B = 42;
   const pw = W - L - R, ph = H - T - B;
-  const logs = base.flatMap(p => [p.cost, ...(p.scored_runs || []).map(r => r.cost).filter(Number.isFinite)]).map(Math.log10);
-  let lo = Math.min(...logs), hi = Math.max(...logs);
+  const logX = chartScale === "log";
+  const costs = base.flatMap(p => [p.cost, ...(p.scored_runs || []).map(r => r.cost).filter(Number.isFinite)]).filter(c => c > 0);
+  const vals = logX ? costs.map(Math.log10) : costs;
+  let lo = Math.min(...vals), hi = Math.max(...vals);
   if (lo === hi) { lo -= 0.5; hi += 0.5; }
   const scores = base.flatMap(p => [p.progress, ...(p.scored_runs || []).map(r => r.progress).filter(Number.isFinite)]);
   const pad = (Math.max(...scores) - Math.min(...scores)) * 0.08 || 1;
   const y0 = Math.max(0, Math.min(...scores) - pad), y1 = Math.max(...scores) + pad;
-  const X = c => L + (Math.log10(c) - lo) / (hi - lo) * pw;
+  const X = c => L + ((logX ? Math.log10(c) : c) - lo) / (hi - lo) * pw;
   const Y = v => T + ph - (v - y0) / (y1 - y0) * ph;
   const powers = [];
-  for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) powers.push(10 ** e);
-  const xticks = [...new Set([...powers, 10 ** lo, 10 ** hi].map(v => Number(v.toPrecision(4))))].sort((a, b) => a - b);
+  if (logX) for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) powers.push(10 ** e);
+  const xticks = logX
+    ? [...new Set([...powers, 10 ** lo, 10 ** hi].map(v => Number(v.toPrecision(4))))].sort((a, b) => a - b)
+    : Array.from({ length: 5 }, (_, i) => Number((lo + (hi - lo) * i / 4).toPrecision(3)));
   const yticks = Array.from({ length: 5 }, (_, i) => y0 + (y1 - y0) * i / 4);
   // A small score range rounds several ticks to the same label; pick the
   // decimals from the span, and drop x ticks that would print on top of each other.
@@ -174,7 +179,7 @@ function renderChart() {
     `<text x="${x}" y="${T + ph + 16}" text-anchor="middle" fill="#777" font-size="11">${usd(v)}</text>`).join("");
   s += `<line x1="${L}" y1="${T + ph}" x2="${L + pw}" y2="${T + ph}" stroke="#444"/>` +
     `<line x1="${L}" y1="${T}" x2="${L}" y2="${T + ph}" stroke="#444"/>` +
-    `<text x="${L + pw / 2}" y="${H - 4}" text-anchor="middle" fill="#999" font-size="12">avg API cost (USD) per rollout</text>` +
+    `<text x="${L + pw / 2}" y="${H - 4}" text-anchor="middle" fill="#999" font-size="12">avg API cost (USD) per rollout · ${chartScale}</text>` +
     `<text transform="translate(14 ${T + ph / 2}) rotate(-90)" text-anchor="middle" fill="#999" font-size="12">score (%)</text>`;
 
   chartPoints = pts;
@@ -216,40 +221,52 @@ function renderChart() {
 function layoutLabels() {
   const L = 58, R = 24, T = 20, B = 42, W = 820, H = 380;
   const x0 = L, x1 = W - R, y0 = T, y1 = H - B;
-  const placed = [];
-  const overlaps = (a, b) => !(a.x1 < b.x0 || a.x0 > b.x1 || a.y1 < b.y0 || a.y0 > b.y1);
-  const boxes = [...$("chart").querySelectorAll("g.lbl")]
-    .sort((a, b) => Number(a.dataset.ay) - Number(b.dataset.ay));
-  for (const g of boxes) {
-    const ax = Number(g.dataset.ax), ay = Number(g.dataset.ay);
+  const overlaps = (a, b) => !(a.x1 <= b.x0 || a.x0 >= b.x1 || a.y1 <= b.y0 || a.y0 >= b.y1);
+  const items = [...$("chart").querySelectorAll("g.lbl")].map(g => {
     const text = g.querySelector("text");
-    const w = (text.getComputedTextLength ? text.getComputedTextLength() : text.getBBox().width) + 2;
-    const h = 12;
-    const offsets = [];
-    for (const dy of [-3, -12, 6, -21, 15, -30, 24]) offsets.push([9, dy, "start"], [-9, dy, "end"]);
-    let box = null, lx = 0, ly = 0, anchor = "start";
-    for (const [dx, dy, a] of offsets) {
-      const tx = ax + dx, ty = ay + dy;
-      const rect = { x0: a === "start" ? tx : tx - w, x1: a === "start" ? tx + w : tx,
-                     y0: ty - h + 2, y1: ty + 3 };
-      if (rect.x0 < x0 + 2 || rect.x1 > x1 - 2 || rect.y0 < y0 || rect.y1 > y1) continue;
-      if (placed.some(p => overlaps(rect, p))) continue;
-      box = rect; lx = tx; ly = ty; anchor = a; break;
+    return { g, text, ax: Number(g.dataset.ax), ay: Number(g.dataset.ay),
+      w: (text.getComputedTextLength ? text.getComputedTextLength() : text.getBBox().width) + 2 };
+  }).sort((a, b) => a.ay - b.ay);
+  const placed = [], leaders = [];
+  const boxAt = (it, lx, ly, a) => ({ x0: a === "start" ? lx : lx - it.w, x1: a === "start" ? lx + it.w : lx,
+    y0: ly - 11, y1: ly + 3 });
+  const fits = r => r.x0 >= x0 + 1 && r.x1 <= x1 - 1 && r.y0 >= y0 && r.y1 <= y1
+    && !placed.some(p => overlaps(r, p));
+  for (const it of items) {
+    let hit = null;
+    for (const dy of [-3, -12, 6, -21, 15]) {
+      for (const [dx, a] of [[9, "start"], [-9, "end"]]) {
+        const r = boxAt(it, it.ax + dx, it.ay + dy, a);
+        if (!fits(r)) continue;
+        hit = { lx: it.ax + dx, ly: it.ay + dy, a, r }; break;
+      }
+      if (hit) break;
     }
-    if (!box) {
-      anchor = ax > (x0 + x1) / 2 ? "end" : "start";
-      lx = anchor === "start" ? x0 + 2 : x1 - 2;
-      ly = Math.min(Math.max(ay + 3, y0 + h), y1);
-      const at = () => ({ x0: anchor === "start" ? lx : lx - w,
-                          x1: anchor === "start" ? lx + w : lx, y0: ly - h + 2, y1: ly + 3 });
-      while (placed.some(p => overlaps(at(), p)) && ly < H - 6) ly += h;
-      box = at();
+    if (!hit) {
+      let best = null;
+      for (let ly = y0 + 12; ly <= y1 - 2; ly += 12)
+        for (let lx = x0 + 2; lx <= x1 - 40; lx += 14) {
+          const a = it.ax < lx + it.w / 2 ? "start" : "end";
+          const x = a === "start" ? lx : lx + it.w;
+          const r = boxAt(it, x, ly, a);
+          if (!fits(r)) continue;
+          const d = Math.hypot((r.x0 + r.x1) / 2 - it.ax, (r.y0 + r.y1) / 2 - it.ay);
+          if (!best || d < best.d) best = { lx: x, ly, a, r, d, far: true };
+        }
+      hit = best;
     }
-    placed.push(box);
-    text.setAttribute("x", lx);
-    text.setAttribute("y", ly);
-    text.setAttribute("text-anchor", anchor);
+    if (!hit) continue;
+    placed.push(hit.r);
+    it.text.setAttribute("x", hit.lx);
+    it.text.setAttribute("y", hit.ly);
+    it.text.setAttribute("text-anchor", hit.a);
+    if (hit.far) {
+      const bx = hit.a === "start" ? hit.r.x0 : hit.r.x1;
+      leaders.push(`<line x1="${bx}" y1="${hit.ly - 4}" x2="${it.ax}" y2="${it.ay}" stroke="${it.text.getAttribute("fill")}" stroke-width="1" opacity=".55"/>`);
+    }
   }
+  if (leaders.length) $("chart").querySelector("g.lbl")
+    .insertAdjacentHTML("beforebegin", `<g class="leaders" pointer-events="none">${leaders.join("")}</g>`);
 }
 
 $("chart").onmousemove = ev => {
@@ -321,6 +338,17 @@ $("modeSwitch").onclick = event => {
   budget = "";
   renderModeSwitch(data.modes);
   load();
+};
+const renderScaleSwitch = () => $("scaleSwitch").querySelectorAll("button").forEach(b =>
+  b.setAttribute("aria-pressed", String(b.dataset.scale === chartScale)));
+renderScaleSwitch();
+$("scaleSwitch").onclick = event => {
+  const button = event.target.closest("button[data-scale]");
+  if (!button || button.dataset.scale === chartScale) return;
+  chartScale = button.dataset.scale;
+  localStorage.celestebenchCostScale = chartScale;
+  renderScaleSwitch();
+  renderChart();
 };
 const togglePanel = (button, panel, otherPanel, otherButton) => {
   panel.hidden = !panel.hidden;

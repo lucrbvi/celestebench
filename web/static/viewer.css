@@ -2,7 +2,8 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; font: 13px/1.5 ui-monospace, monospace; background: #111; color: #ccc; height: 100vh; display: flex; flex-direction: column; }
-header { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #333; flex: none; }
+/* Header content lines up with the centered 1200px page column below it. */
+header { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 10px max(16px, calc((100% - 1200px) / 2 + 16px)); border-bottom: 1px solid #333; flex: none; }
 h1, h2 { font-size: 15px; margin: 0; color: #eee; }
 h1 a { color: inherit; text-decoration: none; }
 a { color: #aaa; }
@@ -15,7 +16,7 @@ button:hover, .button:hover { background: #243224; color: #cfc; }
 .danger { color: #f88; }
 .danger:hover { background: #321d1d; color: #faa; }
 button:disabled { opacity: .5; cursor: default; }
-main { display: grid; grid-template-columns: 260px 544px 1fr; gap: 16px; padding: 16px; flex: 1; min-height: 0; }
+main { display: grid; grid-template-columns: 260px 544px 1fr; gap: 16px; padding: 16px; flex: 1; min-height: 0; width: min(1200px, 100%); margin: 0 auto; }
 section, aside { overflow-y: auto; overflow-x: hidden; }
 video { width: 512px; height: 512px; image-rendering: pixelated; background: #000; display: block; }
 #timeline { position: relative; height: 34px; background: #1a1a1a; border: 1px solid #333; margin-top: 6px; cursor: crosshair; overflow: hidden; }
@@ -43,7 +44,7 @@ video { width: 512px; height: 512px; image-rendering: pixelated; background: #00
 #evalForm input.secret { -webkit-text-security: disc; }
 
 #evalPage { display: block; width: min(720px, 100%); }
-#leaderboardPage { display: block; width: min(1100px, 100%); }
+#leaderboardPage { display: block; }
 #leaderboardPage h2 { margin-bottom: 12px; }
 #leaderboardPage label { display: inline-flex; align-items: center; gap: 8px; margin: 10px 0 16px; }
 .modeswitch { display: inline-flex; border: 1px solid #444; margin: 10px 12px 16px 0; vertical-align: middle; }
@@ -121,7 +122,11 @@ td .logo, td .logo-fallback { display: inline-block; vertical-align: -3px; margi
 .chart-wrap { position: relative; width: 100%; height: 360px; background: #161616; border: 1px solid #333; margin-bottom: 16px; }
 .chart-wrap svg { width: 100%; height: 100%; display: block; }
 .chart-point { cursor: pointer; }
+#chart .lbl text { paint-order: stroke fill; stroke: #161616; stroke-width: 3px; stroke-linejoin: round; }
 .chart-tooltip { position: absolute; z-index: 2; pointer-events: none; background: #1c1c1c; border: 1px solid #444; padding: 6px 8px; max-width: 280px; font-size: 12px; }
+.scale-switch { position: absolute; top: 10px; right: 12px; z-index: 3; margin: 0; background: #1c1c1c; }
+.scale-switch button { padding: 3px 12px; font-size: 11px; background: transparent; }
+.scale-switch button:hover { background: #243224; color: #cfc; }
 #chartEmpty { margin-bottom: 16px; }
 @media (max-width: 700px) { .chart-wrap { height: 260px; } }
 
@@ -135,3 +140,17 @@ td .logo, td .logo-fallback { display: inline-block; vertical-align: -3px; margi
 .run-indent { color: #555; margin-right: 7px; }
 .run-detail a { color: #bbb; }
 .run-detail a:hover { color: #cfc; }
+
+nav a.gh { display: inline-flex; padding: 5px 2px; }
+nav a.gh img { width: 16px; height: 16px; display: block; filter: brightness(0) invert(.85); }
+nav a.gh:hover img { filter: brightness(0) invert(1); }
+
+#aboutPage { display: block; width: min(680px, 100%); }
+#aboutPage h2 { margin-bottom: 12px; }
+#aboutPage h3 { font-size: 13px; margin: 20px 0 6px; color: #eee; }
+#aboutPage p { margin: 0 0 10px; }
+#aboutPage code { color: #9c9; background: #161616; padding: 1px 4px; }
+#aboutDemo { float: right; width: 256px; margin: 2px 0 14px 18px; }
+#aboutDemo canvas { width: 256px; height: 256px; image-rendering: pixelated; background: #000; display: block; border: 1px solid #333; }
+#aboutDemo figcaption { font-size: 11px; color: #888; margin-top: 4px; }
+@media (max-width: 700px) { #aboutDemo { float: none; margin: 0 0 14px; } }

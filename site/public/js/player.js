@@ -167,7 +167,7 @@ async function loadRun(name) {
   cursor = 0;
   $("meta").textContent = `${data.label} · ${data.harness_label || data.harness} · ${data.mode}`
     + (data.progress == null ? "" : ` · ${Number(data.progress).toFixed(2)}%`);
-  draw(); show(decisions[0] || null); renderCursor();
+  draw(); show(decisions[0] || null); renderCursor(); start();
 }
 
 $("playPause").onclick = () => playing ? stop() : start();

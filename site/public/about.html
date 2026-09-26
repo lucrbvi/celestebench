@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>about · celestebench</title><link rel="stylesheet" href="/site.css"></head>
+<body>
+<header><h1><a href="/">celestebench</a></h1><nav><a href="/">leaderboard</a><a class="button" href="/play">benchmark yourself</a><a class="gh" href="https://github.com/lucrbvi/celestebench" aria-label="GitHub" title="GitHub"><img src="/logos/github.svg" alt=""></a></nav></header>
+<main id="aboutPage"><section>
+<h2>about</h2>
+
+<figure id="aboutDemo">
+  <canvas id="demo" width="128" height="128"></canvas>
+  <figcaption>gpt-6-astra (5.17%) in Real-Time Control (RTC). <a href="/runs?run=gpt-6-astra%2F2026-09-15-14-58-57-326458ee">Replay with controls</a>.</figcaption>
+</figure>
+
+<p>CelesteBench measures how well AI models play <a href="https://en.wikipedia.org/wiki/Celeste_(video_game)#Conception">Celeste Classic</a> in real-time. It is a free and famously hard platformer built for PICO-8, a fantasy console with deliberate hardware limits. It runs in <a href="https://github.com/ngagesdk/open8">open8</a>, an open-source PICO-8 emulator that also runs in your browser right now.</p>
+
+<h3>loop</h3>
+<p>The model sees the last 3 frames plus its own conversation, then calls one tool, <code>play</code>, with a batch of actions: buttons as a bitmask, and how many frames to hold them. For example <code>{"buttons":18,"frames":15}</code> holds RIGHT+O (run and jump) for half a second. Two modes share this loop:</p>
+<p><b>RTC</b> the game runs at 30 fps and never pauses.</p>
+<p><b>Lite</b> the game pauses while the model thinks, taking latency out of the picture.</p>
+
+<h3>score</h3>
+<p><code>score = 100 × (rooms + fraction of the current room) / 30</code>, within a 300 s time budget. A model that climbs halfway up the first room scores 1.7%.</p>
+
+<h3>what we see so far</h3>
+<p>Even the best models rarely pass the first room. Gpt-6-astra is the only one that does. More thinking hurts: models burn the clock planning instead of acting. And Lite scores stay close to RTC ones, so latency is not the whole story; perception and action quality are.</p>
+<h3>run it yourself</h3>
+<p>The benchmark is open source: clone the <a href="https://github.com/lucrbvi/celestebench">repository</a>, run <code>uv sync</code>, then <code>uv run python -m web.viewer</code>. Or <a href="/play">play the game</a> and see where you would rank.</p>
+</section></main>
+<script src="/player/open8.js"></script>
+<script src="/js/about.js"></script>
+</body></html>
